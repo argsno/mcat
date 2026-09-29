@@ -248,6 +248,7 @@ fn check_images(cli: &Cli) -> ExitCode {
             }
         };
         let renderer = images.for_file(base_dir(Some(path)));
+        let self_protocol = images.protocol();
         for url in markdown::image_urls(&source) {
             total += 1;
             println!("\n{}", url);
@@ -273,7 +274,22 @@ fn check_images(cli: &Cli) -> ExitCode {
                         )
                     };
                     println!("  格式      {}（{pixel} 像素）", info.format);
-                    println!("  显示      {} 列 x {} 行", info.cells.0, info.cells.1);
+                    // Kitty 协议下只发一个维度，另一个由终端按图片宽高比算
+                    let sent = match (self_protocol, info.axis) {
+                        (Protocol::Kitty, image::Axis::Columns) => {
+                            format!("c={}（行数由终端按图片宽高比算）", info.cells.0)
+                        }
+                        (Protocol::Kitty, image::Axis::Rows) => {
+                            format!("r={}（列数由终端算）", info.cells.1)
+                        }
+                        (Protocol::Iterm2, _) => {
+                            format!("{} 列 x {} 行", info.cells.0, info.cells.1)
+                        }
+                    };
+                    println!(
+                        "  显示      {sent}（估算 {}x{} 格）",
+                        info.cells.0, info.cells.1
+                    );
                     println!(
                         "  载荷      {} 字节 -> base64 {} 字符 -> {} 块",
                         info.payload, info.encoded, info.chunks

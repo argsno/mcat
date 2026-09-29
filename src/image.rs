@@ -74,6 +74,27 @@ pub struct Sizing {
     pub max_rows: usize,
 }
 
+/// 发给终端的尺寸约束。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    Columns,
+    Rows,
+}
+
+/// 一张图的显示尺寸。
+///
+/// Kitty 协议只发**一个**维度，另一个由终端按图片宽高比自己算——终端最清楚
+/// 自己字符格的实际像素尺寸。同时发 `c` 和 `r` 在 Ghostty 上不可靠：实测
+/// 宽高比不匹配时图直接不显示，匹配时又被拉伸变形。
+#[derive(Clone, Copy, Debug)]
+pub struct Fit {
+    pub axis: Axis,
+    pub value: usize,
+    /// 两个维度的估算值，只用于降采样预算和报告
+    pub cols: usize,
+    pub rows: usize,
+}
+
 /// 整个进程共用一份：HTTP 连接池、协议、尺寸上限。
 pub struct Images {
     agent: ureq::Agent,
@@ -95,6 +116,10 @@ impl Images {
 
     pub fn sizing(&self) -> Sizing {
         self.sizing
+    }
+
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
     }
 
     /// 为一个文件创建渲染器。相对路径按 `base` 解析，
@@ -128,8 +153,10 @@ pub struct Prepared {
     pub source_pixel: (u32, u32),
     /// 最终编码的像素尺寸，降采样后会变小。
     pub encoded_pixel: (u32, u32),
-    /// 在终端里占多少字符格。
+    /// 在终端里占多少字符格（估算值，Kitty 协议下另一个维度由终端算）。
     pub cells: (usize, usize),
+    /// 实际发给终端的是哪个维度。
+    pub axis: Axis,
     /// 原始字节数与 base64 之后的字符数。
     pub payload: usize,
     pub encoded: usize,
@@ -172,14 +199,15 @@ impl Renderer<'_> {
         let (data, local_path, from_cache) = self.load(url)?;
         let (payload, format, transcoded, source_pixel, encoded_pixel, downscaled) =
             self.convert(&data)?;
-        let (cols, rows) = self.shared.sizing.fit(encoded_pixel.0, encoded_pixel.1);
-        if cols == 0 || rows == 0 {
+        let fit = self.shared.sizing.fit(encoded_pixel.0, encoded_pixel.1);
+        if fit.value == 0 {
             return Err("尺寸算出来是 0".to_string());
         }
         let encoded = BASE64.encode(&payload);
         let sequence = match self.shared.protocol {
-            Protocol::Kitty => kitty_sequence(&self.identity(url), &encoded, cols, rows),
-            Protocol::Iterm2 => iterm2_sequence(&encoded, cols, rows, payload.len()),
+            Protocol::Kitty => kitty_sequence(&self.identity(url), &encoded, fit),
+            // iTerm2 那边靠 preserveAspectRatio，同时给两个维度
+            Protocol::Iterm2 => iterm2_sequence(&encoded, fit.cols, fit.rows, payload.len()),
         };
         Ok(Prepared {
             chunks: sequence.matches("\x1b_G").count().max(1),
@@ -188,7 +216,8 @@ impl Renderer<'_> {
             local_path,
             source_pixel,
             encoded_pixel,
-            cells: (cols, rows),
+            cells: (fit.cols, fit.rows),
+            axis: fit.axis,
             payload: data.len(),
             encoded: encoded.len(),
             transcoded,
@@ -292,29 +321,48 @@ impl Renderer<'_> {
 }
 
 impl Sizing {
-    /// 按宽高比缩放到边界之内，返回占用的字符格数。
+    /// 算出该发给终端的尺寸约束。
     ///
-    /// 字符格不是正方形（大约 1:2），所以高度要按像素比例的一半算，
-    /// 否则图片会被压扁。
-    pub fn fit(&self, width: u32, height: u32) -> (usize, usize) {
+    /// 字符格不是正方形（实测约 1:2），所以高宽比要换算成行列比。
+    /// 这个估算只用来**决定发哪个维度**；另一个维度交给终端按真实字符格算，
+    /// 所以估得不准也不会让图片变形。
+    pub fn fit(&self, width: u32, height: u32) -> Fit {
         if width == 0 || height == 0 {
-            return (0, 0);
+            return Fit {
+                axis: Axis::Columns,
+                value: 0,
+                cols: 0,
+                rows: 0,
+            };
         }
         let aspect = f64::from(height) / f64::from(width);
         let mut cols = self.max_cols;
         let mut rows = ((cols as f64 * aspect) / CELL_RATIO).round() as usize;
         if rows > self.max_rows {
+            // 太高了，改为按高度约束，列数由终端算
             rows = self.max_rows;
             cols = ((rows as f64 * CELL_RATIO) / aspect).round() as usize;
+            return Fit {
+                axis: Axis::Rows,
+                value: rows.max(1),
+                cols: cols.max(1),
+                rows: rows.max(1),
+            };
         }
-        (cols.max(1), rows.max(1))
+        Fit {
+            axis: Axis::Columns,
+            value: cols,
+            cols: cols.max(1),
+            rows: rows.max(1),
+        }
     }
 }
 
 /// 一个字符格按 Retina 算大约 16×32 物理像素，编码到这个分辨率就够了。
+/// 这里用的是估算值，估偏一点只影响文件大小，不影响显示比例。
 fn pixel_budget(sizing: &Sizing, width: u32, height: u32) -> (u32, u32) {
-    let (cols, rows) = sizing.fit(width, height);
-    ((cols * 16) as u32, (rows * 32) as u32)
+    let fit = sizing.fit(width, height);
+    ((fit.cols * 16) as u32, (fit.rows * 32) as u32)
 }
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
@@ -328,25 +376,29 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
 /// - 载荷按 4096 字节分块；除最后一块外都带 `m=1`（后面还有数据），
 ///   最后一块带 `m=0`
 /// - 完整控制数据只发第一块，后续块只带 `m`（规范明确要求）
+/// - **只发 `c` 或 `r` 其中一个**，另一个由终端按图片宽高比算
 ///
-/// 最后两条是最容易搞错的地方，弄错了终端就是什么都不显示：
-/// 终端在收齐并校验完整个序列之前不会显示任何东西，所以单块图片
-/// 也必须发 `m=0`；每块重复 `a=T` 则会被当成一次次的全新传输。
-fn kitty_sequence(url: &str, payload: &str, cols: usize, rows: usize) -> String {
+/// 三处最容易搞错、且错了就完全不显示的地方：
+/// 终端在收齐并校验完整个序列之前什么都不画，所以单块图片也必须发 `m=0`；
+/// 每块重复 `a=T` 会被当成一次次的全新传输；
+/// 同时发 `c` 和 `r` 时规范说会 letterbox，实测 Ghostty 并不如此——
+/// 宽高比不匹配时图直接消失，匹配时也会被拉伸变形。只发一个维度最稳，
+/// 因为终端最清楚自己字符格的实际像素尺寸。
+fn kitty_sequence(url: &str, payload: &str, fit: Fit) -> String {
     let id = image_id(url);
+    let size = match fit.axis {
+        Axis::Columns => format!("c={}", fit.value),
+        Axis::Rows => format!("r={}", fit.value),
+    };
     let mut out = String::new();
     let mut chunks = payload.as_bytes().chunks(KITTY_CHUNK);
     let total = payload.len().div_ceil(KITTY_CHUNK);
     for (i, chunk) in chunks.by_ref().enumerate() {
         let last = i + 1 == total;
-        // m=1 表示后面还有数据，m=0 表示这是最后一块。
-        // 弄反了终端会一直等下一块，图片永远不显示。
-        //
-        // 规范：完整控制数据只发第一块，后续块只能带 m（可选 q）。
-        // 每块都重复 a=T 会被当成一次次的全新传输。
+        // m=1 表示后面还有数据，m=0 表示这是最后一块
         if i == 0 {
             out.push_str(&format!(
-                "\x1b_Ga=T,f=100,i={id},q=2,c={cols},r={rows},m={};",
+                "\x1b_Ga=T,f=100,i={id},q=2,{size},m={};",
                 u8::from(!last)
             ));
         } else {
@@ -483,51 +535,79 @@ fn read_any(path: &Path) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn sizing(cols: usize, rows: usize) -> Sizing {
+        Sizing {
+            max_cols: cols,
+            max_rows: rows,
+        }
+    }
+
     #[test]
-    fn 缩放后不超过边界() {
-        let s = Sizing {
-            max_cols: 40,
-            max_rows: 20,
-        };
-        // 宽图：受宽度限制
-        let (cols, rows) = s.fit(800, 200);
-        assert!(cols <= 40 && rows <= 20);
-        assert_eq!(cols, 40);
-        // 高图：受高度限制
-        let (cols, rows) = s.fit(200, 1600);
-        assert!(cols <= 40 && rows <= 20);
-        assert_eq!(rows, 20);
+    fn 宽图按列数约束() {
+        let fit = sizing(40, 20).fit(800, 200);
+        assert_eq!(fit.axis, Axis::Columns);
+        assert_eq!(fit.value, 40);
+        assert!(fit.cols <= 40 && fit.rows <= 20);
+    }
+
+    #[test]
+    fn 高图改为按行数约束() {
+        let fit = sizing(40, 20).fit(200, 1600);
+        assert_eq!(fit.axis, Axis::Rows);
+        assert_eq!(fit.value, 20);
+        assert!(fit.cols <= 40 && fit.rows <= 20);
     }
 
     #[test]
     fn 缩放保持宽高比() {
-        let s = Sizing {
-            max_cols: 100,
-            max_rows: 100,
-        };
-        let (cols, rows) = s.fit(400, 400);
+        let fit = sizing(100, 100).fit(400, 400);
         // 方形图片：字符格是 1:2，所以行数是列数的两倍
-        assert_eq!(rows, cols * 2);
-        assert!(cols <= 100 && rows <= 100);
+        assert_eq!(fit.rows, fit.cols * 2);
+        assert!(fit.cols <= 100 && fit.rows <= 100);
     }
 
     #[test]
     fn 零尺寸不输出() {
-        let s = Sizing {
-            max_cols: 40,
-            max_rows: 20,
-        };
-        assert_eq!(s.fit(0, 100), (0, 0));
+        let fit = sizing(40, 20).fit(0, 100);
+        assert_eq!(fit.value, 0);
+    }
+
+    fn fit(cols: usize, rows: usize) -> Fit {
+        Fit {
+            axis: Axis::Columns,
+            value: cols,
+            cols,
+            rows,
+        }
     }
 
     #[test]
     fn kitty_单块载荷不分段() {
         let payload = BASE64.encode([0u8; 100]);
-        let seq = kitty_sequence("x", &payload, 10, 5);
+        let seq = kitty_sequence("x", &payload, fit(10, 5));
         assert_eq!(seq.matches("\x1b_G").count(), 1);
         assert!(seq.starts_with("\x1b_Ga=T,f=100,"));
         assert!(seq.ends_with("\x1b\\"));
-        assert!(seq.contains("c=10,r=5"));
+    }
+
+    /// 只发一个维度。实测 Ghostty 同时收到 c 和 r 时行为不可靠：
+    /// 宽高比不匹配就什么都不显示，匹配也会被拉伸变形。
+    #[test]
+    fn kitty_只发一个维度() {
+        let payload = BASE64.encode([0u8; 100]);
+        let seq = kitty_sequence("x", &payload, fit(20, 7));
+        assert!(seq.contains("c=20,"), "{seq:?}");
+        assert!(!seq.contains("r="), "{seq:?}");
+
+        let by_rows = Fit {
+            axis: Axis::Rows,
+            value: 13,
+            cols: 39,
+            rows: 13,
+        };
+        let seq = kitty_sequence("x", &payload, by_rows);
+        assert!(seq.contains("r=13,"), "{seq:?}");
+        assert!(!seq.contains("c="), "{seq:?}");
     }
 
     /// m=0 表示「这是最后一块」。单块图片也必须这么发：
@@ -535,7 +615,7 @@ mod tests {
     #[test]
     fn kitty_单块必须标成最后一块() {
         let payload = BASE64.encode([0u8; 100]);
-        let seq = kitty_sequence("x", &payload, 10, 5);
+        let seq = kitty_sequence("x", &payload, fit(10, 5));
         assert!(seq.contains("m=0;"), "{seq:?}");
         assert!(!seq.contains("m=1;"), "{seq:?}");
     }
@@ -544,7 +624,7 @@ mod tests {
     fn kitty_大载荷按四千字节分块() {
         // 10000 字节编码成 base64 约 13336 字符，4096 一块是 4 块
         let payload = BASE64.encode([0u8; 10000]);
-        let seq = kitty_sequence("x", &payload, 10, 5);
+        let seq = kitty_sequence("x", &payload, fit(10, 5));
         assert_eq!(seq.matches("\x1b_G").count(), 4);
         // 除最后一块外都是 m=1
         assert_eq!(seq.matches("m=1;").count(), 3);
@@ -558,7 +638,7 @@ mod tests {
     #[test]
     fn kitty_只有第一块带完整控制数据() {
         let payload = BASE64.encode([0u8; 10000]);
-        let seq = kitty_sequence("x", &payload, 10, 5);
+        let seq = kitty_sequence("x", &payload, fit(10, 5));
         assert_eq!(seq.matches("a=T").count(), 1, "a=T 只能出现一次");
         assert_eq!(seq.matches("f=100").count(), 1, "f=100 只能出现一次");
         assert_eq!(seq.matches("i=").count(), 1, "i= 只能出现一次");
@@ -734,6 +814,7 @@ mod report_tests {
         assert_eq!(info.source_pixel, (48, 24));
         assert!(!info.transcoded, "PNG 不该转码");
         assert_eq!(info.chunks, 1);
+        assert_eq!(info.axis, Axis::Rows);
         assert_eq!(info.cells, (20, 20));
         assert!(info.sequence.starts_with("\x1b_G"));
         assert_eq!(info.sequence.matches("\x1b_G").count(), info.chunks);
