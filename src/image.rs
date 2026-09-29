@@ -40,16 +40,21 @@ impl Protocol {
         let var = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
         let program = var("TERM_PROGRAM").unwrap_or_default();
 
-        if var("GHOSTTY_RESOURCES_DIR").is_some() || program == "ghostty" {
+        let term = var("TERM").unwrap_or_default();
+        // TERM 也认一下：环境变量被脚本洗掉时只剩它
+        if var("GHOSTTY_RESOURCES_DIR").is_some()
+            || program == "ghostty"
+            || term.starts_with("xterm-ghostty")
+        {
             return Some(Protocol::Kitty);
         }
-        if var("KITTY_WINDOW_ID").is_some() || var("TERM") == Some("xterm-kitty".into()) {
+        if var("KITTY_WINDOW_ID").is_some() || term == "xterm-kitty" {
             return Some(Protocol::Kitty);
         }
         if var("WEZTERM_EXECUTABLE").is_some() || program == "WezTerm" {
             return Some(Protocol::Kitty);
         }
-        if var("TERM") == Some("foot".into()) {
+        if term == "foot" {
             return Some(Protocol::Kitty);
         }
         if program == "iTerm.app" || program == "WezTerm" {
@@ -142,17 +147,27 @@ impl Renderer<'_> {
     /// 渲染一张图片。拿不到数据或者格式不认识时返回 `None`，
     /// 调用方据此退回文字占位。
     pub fn render(&self, url: &str) -> Option<String> {
-        if let Some(cached) = self.seen.borrow().get(url) {
+        // 缓存按解析后的实际文件做键：`./a.png` 和 `a.png` 是同一张图，
+        // 不该处理两遍
+        let key = self.identity(url);
+        if let Some(cached) = self.seen.borrow().get(&key) {
             return cached.clone();
         }
         let rendered = self.prepare(url).ok().map(|p| p.sequence);
-        self.seen
-            .borrow_mut()
-            .insert(url.to_string(), rendered.clone());
+        self.seen.borrow_mut().insert(key, rendered.clone());
         rendered
     }
 
-    /// 图片渲染的每一步。`Err` 里是给��看的原因。
+    /// 图片的稳定标识：本地用解析后的实际路径，远程用 URL。
+    /// 终端按这个 id 去重，所以同一张图必须算出同一个 id。
+    fn identity(&self, url: &str) -> String {
+        if is_remote(url) {
+            return url.to_string();
+        }
+        normalize(&self.resolve(url)).to_string_lossy().into_owned()
+    }
+
+    /// 图片渲染的每一步。`Err` 里是给用户看的原因。
     pub fn prepare(&self, url: &str) -> Result<Prepared, String> {
         let (data, local_path, from_cache) = self.load(url)?;
         let (payload, format, transcoded, source_pixel, encoded_pixel, downscaled) =
@@ -163,7 +178,7 @@ impl Renderer<'_> {
         }
         let encoded = BASE64.encode(&payload);
         let sequence = match self.shared.protocol {
-            Protocol::Kitty => kitty_sequence(url, &encoded, cols, rows),
+            Protocol::Kitty => kitty_sequence(&self.identity(url), &encoded, cols, rows),
             Protocol::Iterm2 => iterm2_sequence(&encoded, cols, rows, payload.len()),
         };
         Ok(Prepared {
@@ -187,7 +202,7 @@ impl Renderer<'_> {
         if is_remote(url) {
             self.fetch(url)
         } else {
-            let path = self.resolve(url);
+            let path = normalize(&self.resolve(url));
             match read_local(&path) {
                 Some(bytes) => Ok((bytes, Some(path), false)),
                 None => Err(format!("读不到 {}", path.display())),
@@ -397,6 +412,13 @@ fn format_name(format: image::ImageFormat) -> &'static str {
 /// 下载失败不算致命，但值得说一句，否则用户会以为图片本来就没有。
 fn log_download_failure(url: &str, error: &str) {
     eprintln!("mcat: 远程图片下载失败 {url}：{error}");
+}
+
+/// 路径归一化：`examples/./a.png` 变成 `examples/a.png`，能解析就变绝对路径。
+/// 相对路径拼出来会带 `./` 和 `..`，报告里显示出来很难看；
+/// 更要紧的是同一张图用两种写法引用会算出两个不同的终端图片 id。
+fn normalize(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn is_remote(url: &str) -> bool {
@@ -655,5 +677,97 @@ mod report_tests {
         assert_eq!(info.cells, (20, 20));
         assert!(info.sequence.starts_with("\x1b_G"));
         assert_eq!(info.sequence.matches("\x1b_G").count(), info.chunks);
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// 1x1 的 PNG。
+    fn tiny_png() -> Vec<u8> {
+        let mut buf = Vec::new();
+        PngEncoder::new(&mut buf)
+            .write_image(&[0, 0, 0, 255], 1, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        buf
+    }
+
+    fn sequence_id(sequence: &str) -> &str {
+        sequence
+            .split("i=")
+            .nth(1)
+            .and_then(|t| t.split(',').next())
+            .unwrap()
+    }
+
+    /// 同一张图的不同写法必须算出同一个终端图片 id，否则终端会当成两张图。
+    #[test]
+    fn 同一张图的两种写法算出同一个_id() {
+        let dir = std::env::temp_dir().join("mcat-test-id");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), tiny_png()).unwrap();
+
+        let images = Images::new(
+            Protocol::Kitty,
+            Sizing {
+                max_cols: 40,
+                max_rows: 10,
+            },
+        );
+        let r = images.for_file(dir.clone());
+        let plain = r.prepare("a.png").unwrap();
+        let dotted = r.prepare("./a.png").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(sequence_id(&plain.sequence), sequence_id(&dotted.sequence));
+    }
+
+    /// 两份文件里的同名图片是不同的图，id 不能撞。
+    #[test]
+    fn 不同目录里的同名图片_id_不同() {
+        let root = std::env::temp_dir().join("mcat-test-id2");
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("x.png"), tiny_png()).unwrap();
+        std::fs::write(b.join("x.png"), tiny_png()).unwrap();
+
+        let images = Images::new(
+            Protocol::Kitty,
+            Sizing {
+                max_cols: 40,
+                max_rows: 10,
+            },
+        );
+        let first = images.for_file(a).prepare("x.png").unwrap();
+        let second = images.for_file(b).prepare("x.png").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_ne!(
+            sequence_id(&first.sequence),
+            sequence_id(&second.sequence),
+            "不同目录的同名图片应该有不同的 id"
+        );
+    }
+
+    /// 归一化之后显示出来的路径是干净的。
+    #[test]
+    fn 路径归一化去掉_点和双点() {
+        let dir = std::env::temp_dir().join("mcat-test-norm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), tiny_png()).unwrap();
+
+        // 两次归一化都得在文件还在的时候做，canonicalize 失败会退回原路径
+        let from_messy = normalize(&dir.join(".").join("a.png"));
+        let from_clean = normalize(&dir.join("a.png"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !from_messy.to_string_lossy().contains("/./"),
+            "路径里不该再有 ./：{}",
+            from_messy.display()
+        );
+        assert_eq!(from_messy, from_clean);
     }
 }
