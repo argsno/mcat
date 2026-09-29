@@ -11,6 +11,8 @@
 ## 用法
 
 ```console
+$ mcat a.png                     # 直接看一张图，铺满终端
+$ mcat --image-rows 12 shot.jpg  # 限制成 12 行高
 $ mcat README.md                 # 渲染 Markdown，含图片
 $ mcat README.md src/main.rs     # Markdown + 语法高亮
 $ git log -p | mcat               # 标准输入按 Markdown 处理
@@ -94,6 +96,17 @@ Markdown 里的图片按终端能力选协议：
   有效期 24 小时，按 URL 的 SHA-256 命名。下载失败时会用过期缓存，不让图片整个消失。
 - **下载有上限。** 单张图片超过 20 MB 直接放弃；超时 30 秒。
 - **表格里不嵌图片。** 控制序列会撑破单元格，那里也退回文字占位。
+
+### 直接看图片
+
+`mcat a.png` 会直接把图画出来，等价于一个极简的看图工具。判断看的是**文件内容**
+（magic bytes）而不是扩展名，所以扩展名写着 `.jpg` 但实际是 PNG 的文件也能正常显示。
+
+两套默认尺寸：嵌在 Markdown 里的图最多 20 行，免得把正文顶出屏幕；单独看一张图
+铺满终端。`--image-rows` / `--image-cols` 显式给了就以你给的为准。识别支持的格式：
+PNG、JPEG、GIF、WebP、BMP。
+
+标准输入不参与图片识别 —— `git log -p | mcat` 的行为不会变。
 
 ### 排查：图片没出来
 

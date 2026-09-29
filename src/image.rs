@@ -99,42 +99,75 @@ pub struct Fit {
 pub struct Images {
     agent: ureq::Agent,
     protocol: Protocol,
-    sizing: Sizing,
+    /// Markdown 里嵌的图片：留出空间给正文。
+    embedded: Sizing,
+    /// 单独看一张图：铺满终端。
+    full: Sizing,
 }
 
 impl Images {
-    pub fn new(protocol: Protocol, sizing: Sizing) -> Self {
+    pub fn new(protocol: Protocol, embedded: Sizing, full: Sizing) -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(TIMEOUT))
             .build();
         Images {
             agent: ureq::Agent::new_with_config(config),
             protocol,
-            sizing,
+            embedded,
+            full,
         }
     }
 
     pub fn sizing(&self) -> Sizing {
-        self.sizing
+        self.embedded
+    }
+
+    /// 单独看一张图时的尺寸。
+    pub fn full_sizing(&self) -> Sizing {
+        self.full
     }
 
     pub fn protocol(&self) -> Protocol {
         self.protocol
     }
 
-    /// 为一个文件创建渲染器。相对路径按 `base` 解析，
-    /// 两份文件里的同名相对路径不会互相串味。
+    /// Markdown 里嵌的图片。
     pub fn for_file(&self, base: PathBuf) -> Renderer<'_> {
+        self.renderer(base, self.embedded)
+    }
+
+    /// 单独看一张图片，按铺满终端算。
+    pub fn for_image(&self) -> Renderer<'_> {
+        self.renderer(PathBuf::from("."), self.full)
+    }
+
+    fn renderer(&self, base: PathBuf, sizing: Sizing) -> Renderer<'_> {
         Renderer {
             shared: self,
+            sizing,
             base,
             seen: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// 图片内容是不是我们支持的格式。
+    pub fn is_image(bytes: &[u8]) -> bool {
+        image::guess_format(bytes).is_ok_and(|f| {
+            matches!(
+                f,
+                image::ImageFormat::Png
+                    | image::ImageFormat::Jpeg
+                    | image::ImageFormat::Gif
+                    | image::ImageFormat::WebP
+                    | image::ImageFormat::Bmp
+            )
+        })
     }
 }
 
 pub struct Renderer<'a> {
     shared: &'a Images,
+    sizing: Sizing,
     /// 相对路径的基准目录（Markdown 文件所在目录）。
     base: PathBuf,
     /// 同一次运行里，同一张图只处理一次。
@@ -199,7 +232,7 @@ impl Renderer<'_> {
         let (data, local_path, from_cache) = self.load(url)?;
         let (payload, format, transcoded, source_pixel, encoded_pixel, downscaled) =
             self.convert(&data)?;
-        let fit = self.shared.sizing.fit(encoded_pixel.0, encoded_pixel.1);
+        let fit = self.sizing.fit(encoded_pixel.0, encoded_pixel.1);
         if fit.value == 0 {
             return Err("尺寸算出来是 0".to_string());
         }
@@ -313,7 +346,7 @@ impl Renderer<'_> {
         if format == image::ImageFormat::Png {
             return Ok((data.to_vec(), name, false, source, source, false));
         }
-        let budget = pixel_budget(&self.shared.sizing, source.0, source.1);
+        let budget = pixel_budget(&self.sizing, source.0, source.1);
         let (payload, w, h) = to_png(data, budget).ok_or_else(|| "转码成 PNG 失败".to_string())?;
         let downscaled = (w, h) != source;
         Ok((payload, name, true, source, (w, h), downscaled))
@@ -777,6 +810,10 @@ mod report_tests {
                 max_cols: 80,
                 max_rows: 20,
             },
+            Sizing {
+                max_cols: 80,
+                max_rows: 24,
+            },
         )
     }
 
@@ -855,6 +892,10 @@ mod identity_tests {
                 max_cols: 40,
                 max_rows: 10,
             },
+            Sizing {
+                max_cols: 40,
+                max_rows: 10,
+            },
         );
         let r = images.for_file(dir.clone());
         let plain = r.prepare("a.png").unwrap();
@@ -876,6 +917,10 @@ mod identity_tests {
 
         let images = Images::new(
             Protocol::Kitty,
+            Sizing {
+                max_cols: 40,
+                max_rows: 10,
+            },
             Sizing {
                 max_cols: 40,
                 max_rows: 10,
@@ -910,5 +955,62 @@ mod identity_tests {
             from_messy.display()
         );
         assert_eq!(from_messy, from_clean);
+    }
+}
+
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+
+    /// 2x2 的 PNG。
+    fn tiny_png() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(img.as_raw(), 2, 2, ExtendedColorType::Rgba8)
+            .unwrap();
+        png
+    }
+
+    /// 认内容而不是扩展名，所以扩展名骗人也无所谓。
+    #[test]
+    fn 按内容识别图片() {
+        assert!(Images::is_image(&tiny_png()));
+    }
+
+    #[test]
+    fn 普通文本不算图片() {
+        assert!(!Images::is_image(b"# Markdown\n\nhello\n"));
+        assert!(!Images::is_image(b"fn main() {}\n"));
+        assert!(!Images::is_image(b""));
+        // 中文 UTF-8 也不行
+        assert!(!Images::is_image("标题\n\n段落。\n".as_bytes()));
+    }
+
+    #[test]
+    fn jpeg_也算图片() {
+        // 最小 JPEG：SOI + APP0 头就够让 guess_format 认出来
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpeg.extend_from_slice(&[0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00]);
+        jpeg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x00]);
+        assert!(Images::is_image(&jpeg));
+    }
+
+    /// 单独看图用铺满终端的尺寸，嵌在 Markdown 里用留出正文空间的尺寸。
+    #[test]
+    fn 两套尺寸各司其职() {
+        let images = Images::new(
+            Protocol::Kitty,
+            Sizing {
+                max_cols: 80,
+                max_rows: 20,
+            },
+            Sizing {
+                max_cols: 80,
+                max_rows: 60,
+            },
+        );
+        assert_eq!(images.sizing().max_rows, 20);
+        assert_eq!(images.full_sizing().max_rows, 60);
     }
 }

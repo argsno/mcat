@@ -67,13 +67,13 @@ struct Cli {
     #[arg(long, value_name = "PROTO", default_value = "auto")]
     image_protocol: String,
 
-    /// 图片最多占多少行
-    #[arg(long, value_name = "N", default_value_t = 20)]
-    image_rows: usize,
+    /// 图片最多占多少行。不给时：嵌在 Markdown 里用 20，单独看一张图铺满终端
+    #[arg(long, value_name = "N")]
+    image_rows: Option<usize>,
 
-    /// 图片最多占多少列，0 表示按终端宽度
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    image_cols: usize,
+    /// 图片最多占多少列。不给时按终端宽度
+    #[arg(long, value_name = "N")]
+    image_cols: Option<usize>,
 
     /// 不输出内容，只报告图片功能的每一项决策，排查用
     #[arg(long)]
@@ -227,9 +227,15 @@ fn check_images(cli: &Cli) -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let sizing = images.sizing();
+    let given = |v: Option<usize>| v.map_or("自动".to_string(), |n| n.to_string());
     println!(
-        "显示上限    {} 列 x {} 行（--image-cols {}，--image-rows {}）",
-        sizing.max_cols, sizing.max_rows, cli.image_cols, cli.image_rows
+        "显示上限    嵌入 {}x{} 格，单独看图 {}x{} 格（--image-cols {}，--image-rows {}）",
+        sizing.max_cols,
+        sizing.max_rows,
+        images.full_sizing().max_cols,
+        images.full_sizing().max_rows,
+        given(cli.image_cols),
+        given(cli.image_rows)
     );
 
     if cli.files.is_empty() {
@@ -247,9 +253,19 @@ fn check_images(cli: &Cli) -> ExitCode {
                 continue;
             }
         };
-        let renderer = images.for_file(base_dir(Some(path)));
+        // 文件本身就是图片时没有 Markdown 树，直接把它当成唯一一张待查的图
+        let standalone = Images::is_image(source.as_bytes());
+        let (urls, renderer) = if standalone {
+            (
+                vec![path.to_string_lossy().into_owned()],
+                images.for_image(),
+            )
+        } else {
+            let renderer = images.for_file(base_dir(Some(path)));
+            (markdown::image_urls(&source), renderer)
+        };
         let self_protocol = images.protocol();
-        for url in markdown::image_urls(&source) {
+        for url in urls {
             total += 1;
             println!("\n{}", url);
             match renderer.prepare(&url) {
@@ -353,18 +369,22 @@ fn image_backend(cli: &Cli) -> Option<Images> {
             return None;
         }
     };
-    // 拿不到终端宽度就按 80 列算
-    let cols = match cli.image_cols {
-        0 => terminal_size::terminal_size().map_or(80, |(w, _)| w.0 as usize),
-        n => n,
+    // 拿不到终端尺寸就用 80x24 兜底
+    let term = terminal_size::terminal_size();
+    let term_cols = term.map_or(80, |(w, _)| w.0 as usize);
+    let term_rows = term.map_or(24, |(_, h)| h.0 as usize);
+
+    // 嵌在 Markdown 里的图要给正文留位置，单独看一张图就铺满
+    let cols = cli.image_cols.unwrap_or(term_cols).clamp(1, 1000);
+    let embedded = Sizing {
+        max_cols: cols,
+        max_rows: cli.image_rows.unwrap_or(20).max(1),
     };
-    Some(Images::new(
-        protocol,
-        Sizing {
-            max_cols: cols.clamp(1, 1000),
-            max_rows: cli.image_rows.max(1),
-        },
-    ))
+    let full = Sizing {
+        max_cols: cols,
+        max_rows: cli.image_rows.unwrap_or(term_rows).max(1),
+    };
+    Some(Images::new(protocol, embedded, full))
 }
 
 /// 内容决定怎么输出。写入失败由 `Painter` 记录，这里不用返回错误。
@@ -376,6 +396,29 @@ fn emit(
     path: Option<&Path>,
     bytes: &[u8],
 ) {
+    // 直接给一张图片（mcat a.png）：画出来，不做文本渲染。
+    // 认内容而不是扩展名，扩展名经常骗人。
+    // 标准输入不参与判断，免得 `git log -p | mcat` 的行为变掉。
+    if path.is_some()
+        && !cli.no_render
+        && !cli.no_images
+        && let Some(images) = images
+        && Images::is_image(bytes)
+    {
+        // 图片 id 按真实路径算，所以传绝对路径进来
+        if let Some(path) = path {
+            let renderer = images.for_image();
+            match renderer.prepare(&path.to_string_lossy()) {
+                Ok(info) => {
+                    out.write_control(&info.sequence);
+                    out.newline();
+                }
+                Err(reason) => report(path, &io::Error::other(reason)),
+            }
+        }
+        return;
+    }
+
     let text = match std::str::from_utf8(bytes) {
         Ok(text) => text,
         // 不是 UTF-8 就别乱渲染了，原样输出
@@ -420,7 +463,7 @@ enum Mode<'a> {
 }
 
 fn resolve<'a>(cli: &Cli, hl: &'a Highlighter, path: Option<&Path>, first_line: &str) -> Mode<'a> {
-    if cli.no_render {
+    if cli.no_render || cli.no_images {
         return Mode::Raw;
     }
 
