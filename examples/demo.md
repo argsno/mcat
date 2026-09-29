@@ -2,7 +2,7 @@
 
 普通段落里有 **粗体**、*斜体*、~~删除线~~、`行内代码`，还有一个
 [外部链接](https://example.com/very/long/path?query=1&x=2) 和
-![示意图](docs/diagram.png)。
+![示意图](./diagram.png)。
 
 ## 二级标题
 

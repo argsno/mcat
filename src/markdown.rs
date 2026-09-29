@@ -354,6 +354,21 @@ pub fn parse(src: &str) -> Node {
     builder.finish()
 }
 
+/// 按出现顺序收集文档里引用的所有图片，供 `--check-images` 报告。
+pub fn image_urls(src: &str) -> Vec<String> {
+    fn walk(node: &Node, out: &mut Vec<String>) {
+        if let Kind::Image(url) = &node.kind {
+            out.push(url.clone());
+        }
+        for child in &node.children {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&parse(src), &mut out);
+    out
+}
+
 // ---------------------------------------------------------------- 渲染
 
 /// 列表标记：写在父层前缀之后，并顶掉首行对应的缩进。

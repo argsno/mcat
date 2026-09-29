@@ -88,6 +88,10 @@ impl Images {
         }
     }
 
+    pub fn sizing(&self) -> Sizing {
+        self.sizing
+    }
+
     /// 为一个文件创建渲染器。相对路径按 `base` 解析，
     /// 两份文件里的同名相对路径不会互相串味。
     pub fn for_file(&self, base: PathBuf) -> Renderer<'_> {
@@ -107,6 +111,33 @@ pub struct Renderer<'a> {
     seen: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
 }
 
+/// 一张图准备就绪之后的全部信息，`--check-images` 靠它报告。
+#[derive(Debug)]
+pub struct Prepared {
+    pub sequence: String,
+    /// 人类可读的格式名。
+    pub format: &'static str,
+    /// 相对路径解析到哪儿了（远程图片为 `None`）。
+    pub local_path: Option<PathBuf>,
+    /// 编码前的像素尺寸。
+    pub source_pixel: (u32, u32),
+    /// 最终编码的像素尺寸，降采样后会变小。
+    pub encoded_pixel: (u32, u32),
+    /// 在终端里占多少字符格。
+    pub cells: (usize, usize),
+    /// 原始字节数与 base64 之后的字符数。
+    pub payload: usize,
+    pub encoded: usize,
+    /// 拆成几块（iTerm2 协议只有一段）。
+    pub chunks: usize,
+    /// 因为协议只支持 PNG 而转码了。
+    pub transcoded: bool,
+    /// 因为超过显示尺寸而降采样了。
+    pub downscaled: bool,
+    /// 远程图片是不是走了缓存。
+    pub from_cache: bool,
+}
+
 impl Renderer<'_> {
     /// 渲染一张图片。拿不到数据或者格式不认识时返回 `None`，
     /// 调用方据此退回文字占位。
@@ -114,19 +145,53 @@ impl Renderer<'_> {
         if let Some(cached) = self.seen.borrow().get(url) {
             return cached.clone();
         }
-        let rendered = self.load(url).and_then(|data| self.encode(url, &data));
+        let rendered = self.prepare(url).ok().map(|p| p.sequence);
         self.seen
             .borrow_mut()
             .insert(url.to_string(), rendered.clone());
         rendered
     }
 
+    /// 图片渲染的每一步。`Err` 里是给��看的原因。
+    pub fn prepare(&self, url: &str) -> Result<Prepared, String> {
+        let (data, local_path, from_cache) = self.load(url)?;
+        let (payload, format, transcoded, source_pixel, encoded_pixel, downscaled) =
+            self.convert(&data)?;
+        let (cols, rows) = self.shared.sizing.fit(encoded_pixel.0, encoded_pixel.1);
+        if cols == 0 || rows == 0 {
+            return Err("尺寸算出来是 0".to_string());
+        }
+        let encoded = BASE64.encode(&payload);
+        let sequence = match self.shared.protocol {
+            Protocol::Kitty => kitty_sequence(url, &encoded, cols, rows),
+            Protocol::Iterm2 => iterm2_sequence(&encoded, cols, rows, payload.len()),
+        };
+        Ok(Prepared {
+            chunks: sequence.matches("\x1b_G").count().max(1),
+            sequence,
+            format,
+            local_path,
+            source_pixel,
+            encoded_pixel,
+            cells: (cols, rows),
+            payload: data.len(),
+            encoded: encoded.len(),
+            transcoded,
+            downscaled,
+            from_cache,
+        })
+    }
+
     /// 拿到图片字节：远程走下载加缓存，本地直接读。
-    fn load(&self, url: &str) -> Option<Vec<u8>> {
+    fn load(&self, url: &str) -> Result<(Vec<u8>, Option<PathBuf>, bool), String> {
         if is_remote(url) {
             self.fetch(url)
         } else {
-            read_local(&self.resolve(url))
+            let path = self.resolve(url);
+            match read_local(&path) {
+                Some(bytes) => Ok((bytes, Some(path), false)),
+                None => Err(format!("读不到 {}", path.display())),
+            }
         }
     }
 
@@ -143,10 +208,10 @@ impl Renderer<'_> {
         path.to_path_buf()
     }
 
-    fn fetch(&self, url: &str) -> Option<Vec<u8>> {
+    fn fetch(&self, url: &str) -> Result<(Vec<u8>, Option<PathBuf>, bool), String> {
         let cache = cache_path(url);
         if let Some(bytes) = read_fresh(&cache) {
-            return Some(bytes);
+            return Ok((bytes, None, true));
         }
         let fetched = self.download(url);
         if let Some(ref bytes) = fetched {
@@ -156,11 +221,24 @@ impl Renderer<'_> {
             let _ = std::fs::write(&cache, bytes);
         }
         // 下载失败时宁可给过期的图，也不要什么都没有
-        fetched.or_else(|| read_any(&cache))
+        match fetched {
+            Some(bytes) => Ok((bytes, None, false)),
+            // 过期缓存也算命中，只是不能算「新鲜」
+            None => read_any(&cache)
+                .map(|bytes| (bytes, None, true))
+                .ok_or_else(|| format!("下载失败，缓存里也没有：{url}")),
+        }
     }
 
     fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let response = self.shared.agent.get(url).call().ok()?;
+        let response = self
+            .shared
+            .agent
+            .get(url)
+            .call()
+            .map_err(|e| e.to_string())
+            .inspect_err(|e| log_download_failure(url, e))
+            .ok()?;
         if response.status() != 200 {
             return None;
         }
@@ -174,35 +252,27 @@ impl Renderer<'_> {
         Some(bytes)
     }
 
-    /// 识别格式、必要时转码，然后算出行列数，交给对应协议编码。
-    fn encode(&self, url: &str, data: &[u8]) -> Option<String> {
-        let format = image::guess_format(data).ok()?;
-        let protocol = self.shared.protocol;
-        // Kitty 只认 PNG；iTerm2 自己能解码 JPEG/GIF，原样传即可
-        let (payload, width, height) = match (protocol, format) {
-            (Protocol::Kitty, image::ImageFormat::Png) => {
-                let (w, h) = dimensions(data)?;
-                (data.to_vec(), w, h)
-            }
-            (Protocol::Kitty, _) => {
-                let (w, h) = dimensions(data)?;
-                to_png(data, pixel_budget(&self.shared.sizing, w, h))?
-            }
-            (Protocol::Iterm2, _) => {
-                let (w, h) = dimensions(data)?;
-                (data.to_vec(), w, h)
-            }
-        };
+    /// 转码 + 降采样。iTerm2 协议直接用原始字节，Kitty 必须转成 PNG。
+    #[allow(clippy::type_complexity)]
+    fn convert(
+        &self,
+        data: &[u8],
+    ) -> Result<(Vec<u8>, &'static str, bool, (u32, u32), (u32, u32), bool), String> {
+        let format = image::guess_format(data).map_err(|_| "不是能识别的图片格式".to_string())?;
+        let name = format_name(format);
+        let source = dimensions(data).ok_or_else(|| "读不出图片尺寸".to_string())?;
 
-        let (cols, rows) = self.shared.sizing.fit(width, height);
-        if cols == 0 || rows == 0 {
-            return None;
+        // iTerm2 自己能解码原始字节，Kitty 只认 PNG
+        if self.shared.protocol == Protocol::Iterm2 {
+            return Ok((data.to_vec(), name, false, source, source, false));
         }
-        let encoded = BASE64.encode(&payload);
-        match protocol {
-            Protocol::Kitty => Some(kitty_sequence(url, &encoded, cols, rows)),
-            Protocol::Iterm2 => Some(iterm2_sequence(&encoded, cols, rows, payload.len())),
+        if format == image::ImageFormat::Png {
+            return Ok((data.to_vec(), name, false, source, source, false));
         }
+        let budget = pixel_budget(&self.shared.sizing, source.0, source.1);
+        let (payload, w, h) = to_png(data, budget).ok_or_else(|| "转码成 PNG 失败".to_string())?;
+        let downscaled = (w, h) != source;
+        Ok((payload, name, true, source, (w, h), downscaled))
     }
 }
 
@@ -311,6 +381,22 @@ fn encode_png(rgba: &image::RgbaImage, width: u32, height: u32) -> Option<(Vec<u
         .write_image(rgba.as_raw(), width, height, ExtendedColorType::Rgba8)
         .ok()?;
     Some((out, width, height))
+}
+
+fn format_name(format: image::ImageFormat) -> &'static str {
+    match format {
+        image::ImageFormat::Png => "PNG",
+        image::ImageFormat::Jpeg => "JPEG",
+        image::ImageFormat::Gif => "GIF",
+        image::ImageFormat::WebP => "WebP",
+        image::ImageFormat::Bmp => "BMP",
+        _ => "其他",
+    }
+}
+
+/// 下载失败不算致命，但值得说一句，否则用户会以为图片本来就没有。
+fn log_download_failure(url: &str, error: &str) {
+    eprintln!("mcat: 远程图片下载失败 {url}：{error}");
 }
 
 fn is_remote(url: &str) -> bool {
@@ -515,5 +601,59 @@ mod resize_tests {
         let small = image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
         let (_, w, h) = to_png(&encode(&small), (640, 640)).unwrap();
         assert_eq!((w, h), (8, 8));
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    fn images() -> Images {
+        Images::new(
+            Protocol::Kitty,
+            Sizing {
+                max_cols: 80,
+                max_rows: 20,
+            },
+        )
+    }
+
+    /// 找不到的文件要报出人能看懂的路径，而不是崩掉。
+    #[test]
+    fn 报告能说明失败原因() {
+        let dir = std::env::temp_dir().join("mcat-test-missing");
+        let err = images()
+            .for_file(dir)
+            .prepare("nope.png")
+            .expect_err("文件不存在应该失败");
+        assert!(err.contains("读不到"), "{err}");
+        assert!(err.contains("nope.png"), "{err}");
+    }
+
+    /// 报告里的信息要能反映真实的编码结果。
+    #[test]
+    fn 报告内容与实际编码一致() {
+        let dir = std::env::temp_dir();
+        let png = dir.join("mcat-test-report.png");
+        let img = image::RgbaImage::from_pixel(48, 24, image::Rgba([1, 2, 3, 255]));
+        let mut buf = Vec::new();
+        PngEncoder::new(&mut buf)
+            .write_image(img.as_raw(), 48, 24, ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&png, buf).unwrap();
+
+        let info = images()
+            .for_file(dir.clone())
+            .prepare("mcat-test-report.png")
+            .expect("刚写的文件应该能读");
+        let _ = std::fs::remove_file(&png);
+
+        assert_eq!(info.format, "PNG");
+        assert_eq!(info.source_pixel, (48, 24));
+        assert!(!info.transcoded, "PNG 不该转码");
+        assert_eq!(info.chunks, 1);
+        assert_eq!(info.cells, (20, 20));
+        assert!(info.sequence.starts_with("\x1b_G"));
+        assert_eq!(info.sequence.matches("\x1b_G").count(), info.chunks);
     }
 }

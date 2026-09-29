@@ -39,6 +39,7 @@ Options:
       --image-protocol <PROTO>  图片协议：auto、kitty、iTerm2 [default: auto]
       --image-rows <N>          图片最多占多少行 [default: 20]
       --image-cols <N>          图片最多占多少列，0 表示按终端宽度 [default: 0]
+      --check-images            不输出内容，只报告图片链路的每一项决策
   -h, --help                    Print help (see more with '--help')
   -V, --version                 Print version
 ```
@@ -87,6 +88,30 @@ Markdown 里的图片按终端能力选协议：
   有效期 24 小时，按 URL 的 SHA-256 命名。下载失败时会用过期缓存，不让图片整个消失。
 - **下载有上限。** 单张图片超过 20 MB 直接放弃；超时 30 秒。
 - **表格里不嵌图片。** 控制序列会撑破单元格，那里也退回文字占位。
+
+### 排查：图片没出来
+
+`--check-images` 不输出正文，只把链路上每一环的决策打出来——协议从哪猜的、文件找没找到、
+格式是什么、最终占多少字符格、载荷多大、序列长什么样。图片没显示时用它定位卡在哪一步：
+
+```console
+$ mcat --check-images README.md
+终端程序    ghostty
+TERM        xterm-256color
+stdout      终端 ✓ 会画图
+图片协议    Kitty（从环境变量推断）
+显示上限    112 列 x 20 行（--image-cols 0，--image-rows 20）
+
+examples/gradient.png
+  文件      examples/gradient.png
+  格式      PNG（48x24 像素）
+  显示      20 列 x 20 行
+  载荷      2816 字节 -> base64 3756 字符 -> 1 块
+  序列      <ESC>_Ga=T,f=100,i=3416104704,q=2,c=20,r=20,m=1;iVBO…（共 3802 字节）
+  结论      ✓ 会输出图形序列
+```
+
+它不受 TTY 限制，重定向输出时也会照常分析（只在开头提示实际运行时不会画图）。
 
 **`-n` 数的是输出行。** Markdown 渲染会重排块（一级标题多一行横线、块之间插空行），
 所以行号和源文件的行号对不上，和 `cat -n` 数输出行的行为一致。

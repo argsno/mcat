@@ -74,10 +74,18 @@ struct Cli {
     /// 图片最多占多少列，0 表示按终端宽度
     #[arg(long, value_name = "N", default_value_t = 0)]
     image_cols: usize,
+
+    /// 不输出内容，只报告图片功能的每一项决策，排查用
+    #[arg(long)]
+    check_images: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if cli.check_images {
+        return check_images(&cli);
+    }
 
     if cli.list_themes {
         let mut out = io::stdout().lock();
@@ -172,9 +180,152 @@ fn read_stdin(
     Ok(())
 }
 
-/// 决定要不要画图片，以及用哪个协议。
+/// 报告图片链路上每一环的决策。图片没显示出来时，用它定位卡在哪一步。
+fn check_images(cli: &Cli) -> ExitCode {
+    let is_terminal = io::stdout().is_terminal();
+    let detected = Protocol::detect();
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+
+    println!(
+        "终端程序    {}",
+        if program.is_empty() {
+            "（未设置 TERM_PROGRAM）"
+        } else {
+            &program
+        }
+    );
+    println!("TERM        {}", std::env::var("TERM").unwrap_or_default());
+    println!(
+        "stdout      {}",
+        if is_terminal {
+            "终端 ✓ 会画图"
+        } else {
+            "不是终端 ✗ 只会输出文字占位"
+        }
+    );
+    let protocol_text = if cli.no_images {
+        "已用 --no-images 关掉".to_string()
+    } else if cli.image_protocol != "auto" {
+        format!("{}（--image-protocol 指定）", cli.image_protocol)
+    } else {
+        match detected {
+            Some(p) => format!("{p:?}（从环境变量推断）"),
+            None => "猜不到 ✗ 只会输出文字占位".to_string(),
+        }
+    };
+    println!("图片协议    {protocol_text}");
+
+    if !is_terminal {
+        println!("\n注意：stdout 不是终端。下面照常分析每张图，但实际运行时不会画出来。");
+    }
+    let Some(images) = image_backend(cli) else {
+        if detected.is_none() {
+            println!(
+                "\n协议猜不到。先在终端里跑一次，或用 --image-protocol kitty / iterm2 强制指定。"
+            );
+        }
+        return ExitCode::SUCCESS;
+    };
+    let sizing = images.sizing();
+    println!(
+        "显示上限    {} 列 x {} 行（--image-cols {}，--image-rows {}）",
+        sizing.max_cols, sizing.max_rows, cli.image_cols, cli.image_rows
+    );
+
+    if cli.files.is_empty() {
+        println!("\n没有指定文件，没什么可查。");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut total = 0usize;
+    let mut ok = 0usize;
+    for path in &cli.files {
+        let source = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                println!("\n{} 读不了：{e}", path.display());
+                continue;
+            }
+        };
+        let renderer = images.for_file(base_dir(Some(path)));
+        for url in markdown::image_urls(&source) {
+            total += 1;
+            println!("\n{}", url);
+            match renderer.prepare(&url) {
+                Ok(info) => {
+                    ok += 1;
+                    if let Some(local) = &info.local_path {
+                        println!("  文件      {}", local.display());
+                    } else if info.from_cache {
+                        println!("  来源      远程（用缓存，没重新下载）");
+                    } else {
+                        println!("  来源      远程（刚下载）");
+                    }
+                    let pixel = if info.source_pixel == info.encoded_pixel {
+                        format!("{}x{}", info.source_pixel.0, info.source_pixel.1)
+                    } else {
+                        format!(
+                            "{}x{} -> {}x{}",
+                            info.source_pixel.0,
+                            info.source_pixel.1,
+                            info.encoded_pixel.0,
+                            info.encoded_pixel.1
+                        )
+                    };
+                    println!("  格式      {}（{pixel} 像素）", info.format);
+                    println!("  显示      {} 列 x {} 行", info.cells.0, info.cells.1);
+                    println!(
+                        "  载荷      {} 字节 -> base64 {} 字符 -> {} 块",
+                        info.payload, info.encoded, info.chunks
+                    );
+                    if info.transcoded {
+                        println!(
+                            "  处理      转码成 PNG（当前协议只支持 PNG）{}",
+                            if info.downscaled { " + 降采样" } else { "" }
+                        );
+                    } else if info.downscaled {
+                        println!("  处理      降采样到显示尺寸");
+                    }
+                    println!("  序列      {}", preview(&info.sequence));
+                    println!("  结论      ✓ 会输出图形序列");
+                }
+                Err(reason) => println!("  结论      ✗ {reason} -> 退回文字占位"),
+            }
+        }
+    }
+    println!("\n共 {total} 张图，{ok} 张会画出来");
+    ExitCode::SUCCESS
+}
+
+/// 转义序列太长没法直接看，截头部加省略号。
+/// 把不可见的 ESC 显示出来，不然报告里看不出序列的边界。
+fn preview(sequence: &str) -> String {
+    let head: String = sequence
+        .chars()
+        .take(48)
+        .map(|c| {
+            if c == '\x1b' {
+                "<ESC>".to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+    format!("{head}…（共 {} 字节）", sequence.len())
+}
+
+/// 决定要不要画图片。stdout 不是终端就不画。
 fn setup_images(cli: &Cli, is_terminal: bool) -> Option<Images> {
-    if cli.no_images || !is_terminal {
+    if !is_terminal {
+        return None;
+    }
+    image_backend(cli)
+}
+
+/// 按参数和终端环境算出图片后端。
+/// 诊断模式不走 `setup_images`：否则 `--check-images` 在重定向输出时什么都不说。
+fn image_backend(cli: &Cli) -> Option<Images> {
+    if cli.no_images {
         return None;
     }
     let protocol = match cli.image_protocol.to_ascii_lowercase().as_str() {
