@@ -4,13 +4,14 @@
 
 - `.md` 文件渲染成终端样式：标题分级配色、列表、引用、表格、任务清单、脚注
 - 代码块（以及 `.rs`、`.py`、`.toml` 等其他文件）交给 [syntect](https://github.com/trishume/syntect) 做语法高亮
+- Markdown 里的图片直接画在终端上（Kitty 图形协议 / iTerm2 内联图片）
 - 行为和 `cat` 一致：多个文件依次输出、读标准输入、`-` 表示标准输入、读不了的文件报错后继续
 - 纯 Rust 实现，没有 C 依赖
 
 ## 用法
 
 ```console
-$ mcat README.md                 # 渲染 Markdown
+$ mcat README.md                 # 渲染 Markdown，含图片
 $ mcat README.md src/main.rs     # Markdown + 语法高亮
 $ git log -p | mcat               # 标准输入按 Markdown 处理
 $ mcat -n README.md               # 加行号
@@ -34,8 +35,12 @@ Options:
       --no-render        不渲染，原样输出（等同 cat）
       --no-color         不输出颜色
       --list-themes      列出所有可用主题后退出
-  -h, --help             Print help (see more with '--help')
-  -V, --version          Print version
+      --no-images               不显示图片，只输出文字占位
+      --image-protocol <PROTO>  图片协议：auto、kitty、iTerm2 [default: auto]
+      --image-rows <N>          图片最多占多少行 [default: 20]
+      --image-cols <N>          图片最多占多少列，0 表示按终端宽度 [default: 0]
+  -h, --help                    Print help (see more with '--help')
+  -V, --version                 Print version
 ```
 
 ## 几个设计上的选择
@@ -58,6 +63,31 @@ Options:
 
 **MIME 和二进制。** 文件不是合法 UTF-8 时原样输出，不做任何渲染。
 
+## 图片
+
+Markdown 里的图片按终端能力选协议：
+
+| 协议 | 终端 | 备注 |
+|---|---|---|
+| Kitty 图形协议 | Ghostty、kitty、WezTerm、foot、Contour | 只认 PNG，其他格式转码 |
+| iTerm2 内联图片 | iTerm2、WezTerm、VS Code | 原始字节交给终端解码，不转码 |
+
+协议从环境变量猜（`TERM_PROGRAM`、`KITTY_WINDOW_ID`、`GHOSTTY_RESOURCES_DIR` 等），
+可以用 `--image-protocol` 强制。猜不出来、不是终端、文件读不到、下载失败——任何一种情况都退回
+`[image] 说明 (路径)` 的文字占位，不会报错。
+
+几个实现上的取舍：
+
+- **只在终端里画图。** 转义序列里是大段 base64，进管道就是垃圾。`mcat README.md | grep foo`
+  拿到的还是纯文本。
+- **按显示尺寸降采样。** Kitty 协议要求 PNG，一张 4000×3000 的 JPEG 转码后能生成几十 MB 的
+  转义序列，足以卡死终端。所以先缩到显示尺寸的两倍分辨率再编码（字符格按 Retina 约 16×32 像素算）。
+- **Kitty 载荷按 4096 字节分块。** 这是协议上限，只有最后一块带 `m=1`。
+- **远程图片有缓存。** 存在 `$XDG_CACHE_HOME/mcat/`（没有则 `~/.cache/mcat/`），
+  有效期 24 小时，按 URL 的 SHA-256 命名。下载失败时会用过期缓存，不让图片整个消失。
+- **下载有上限。** 单张图片超过 20 MB 直接放弃；超时 30 秒。
+- **表格里不嵌图片。** 控制序列会撑破单元格，那里也退回文字占位。
+
 **`-n` 数的是输出行。** Markdown 渲染会重排块（一级标题多一行横线、块之间插空行），
 所以行号和源文件的行号对不上，和 `cat -n` 数输出行的行为一致。
 
@@ -76,6 +106,7 @@ $ cargo clippy --all-targets
 | `src/main.rs` | 命令行、文件读取、按类型分发 |
 | `src/markdown.rs` | Markdown 解析成块/行内树，再渲染成 ANSI 文本 |
 | `src/highlight.rs` | syntect 封装：按语言逐行上色 |
+| `src/image.rs` | 图片协议、下载缓存、降采样转码 |
 | `src/style.rs` | 样式、显示宽度计算、带状态的输出器 |
 
 `src/style.rs` 里的 `Painter` 只在样式变化时写转义序列，并在每行结束时复位，
@@ -87,5 +118,13 @@ $ cargo clippy --all-targets
 |---|---|
 | `pulldown-cmark` | CommonMark 解析 |
 | `syntect` | 语法高亮（fancy-regex 后端，无 C 依赖） |
+| `image` | 非 PNG 格式转码 + 降采样 |
+| `ureq` | 下载远程图片（rustls，无 C 依赖） |
+| `terminal_size` | 终端宽度 |
+| `base64` | 图形协议载荷编码 |
+| `sha2` | 远程图片缓存键 |
 | `unicode-width` | 东亚宽度计算 |
 | `clap` | 命令行解析 |
+
+依赖从 4 个涨到 9 个（65 个传递依赖），冷构建从 6 秒涨到 12 秒。
+`image` 和 `ureq` 是图片功能带来的，是这个工具里最重的两个依赖。

@@ -5,13 +5,15 @@
 //! 多个文件依次输出到标准输出，读不了的文件报错后继续。
 
 mod highlight;
+mod image;
 mod markdown;
 mod style;
 
 use clap::Parser;
 use highlight::Highlighter;
+use image::{Images, Protocol, Sizing};
 use std::fs;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use style::Painter;
@@ -56,6 +58,22 @@ struct Cli {
     /// 列出所有可用主题后退出
     #[arg(long)]
     list_themes: bool,
+
+    /// 不显示图片，只输出文字占位
+    #[arg(long)]
+    no_images: bool,
+
+    /// 图片协议：auto 按终端环境猜，kitty 或 iterm2 强制指定
+    #[arg(long, value_name = "PROTO", default_value = "auto")]
+    image_protocol: String,
+
+    /// 图片最多占多少行
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    image_rows: usize,
+
+    /// 图片最多占多少列，0 表示按终端宽度
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    image_cols: usize,
 }
 
 fn main() -> ExitCode {
@@ -77,6 +95,8 @@ fn main() -> ExitCode {
         }
     };
 
+    // 图片只在终端里画得出来，管道和重定向就退回文字占位
+    let images = setup_images(&cli, io::stdout().is_terminal());
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
     let mut out = Painter::new(&mut writer)
@@ -85,21 +105,21 @@ fn main() -> ExitCode {
     let mut failed = false;
 
     if cli.files.is_empty() {
-        if let Err(e) = read_stdin(&mut out, &cli, &hl) {
+        if let Err(e) = read_stdin(&mut out, &cli, &hl, images.as_ref()) {
             report(Path::new("-"), &e);
             failed = true;
         }
     } else {
         for path in &cli.files {
             if path == Path::new("-") {
-                if let Err(e) = read_stdin(&mut out, &cli, &hl) {
+                if let Err(e) = read_stdin(&mut out, &cli, &hl, images.as_ref()) {
                     report(Path::new("-"), &e);
                     failed = true;
                 }
                 continue;
             }
             match fs::read(path) {
-                Ok(bytes) => emit(&mut out, &cli, &hl, Some(path), &bytes),
+                Ok(bytes) => emit(&mut out, &cli, &hl, images.as_ref(), Some(path), &bytes),
                 Err(e) => {
                     report(path, &e);
                     failed = true;
@@ -128,6 +148,14 @@ fn main() -> ExitCode {
     }
 }
 
+/// 图片相对路径的基准目录：文件所在目录；标准输入用当前目录。
+fn base_dir(path: Option<&Path>) -> PathBuf {
+    match path {
+        Some(path) => path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        None => PathBuf::from("."),
+    }
+}
+
 fn report(path: &Path, e: &io::Error) {
     eprintln!("mcat: {}: {e}", path.display());
 }
@@ -136,11 +164,40 @@ fn read_stdin(
     out: &mut Painter<&mut BufWriter<io::StdoutLock>>,
     cli: &Cli,
     hl: &Highlighter,
+    images: Option<&Images>,
 ) -> io::Result<()> {
     let mut bytes = Vec::new();
     io::stdin().lock().read_to_end(&mut bytes)?;
-    emit(out, cli, hl, None, &bytes);
+    emit(out, cli, hl, images, None, &bytes);
     Ok(())
+}
+
+/// 决定要不要画图片，以及用哪个协议。
+fn setup_images(cli: &Cli, is_terminal: bool) -> Option<Images> {
+    if cli.no_images || !is_terminal {
+        return None;
+    }
+    let protocol = match cli.image_protocol.to_ascii_lowercase().as_str() {
+        "auto" => Protocol::detect()?,
+        "kitty" => Protocol::Kitty,
+        "iterm2" | "iterm" => Protocol::Iterm2,
+        other => {
+            eprintln!("mcat: 未知图片协议 {other:?}，可选：auto、kitty、iterm2");
+            return None;
+        }
+    };
+    // 拿不到终端宽度就按 80 列算
+    let cols = match cli.image_cols {
+        0 => terminal_size::terminal_size().map_or(80, |(w, _)| w.0 as usize),
+        n => n,
+    };
+    Some(Images::new(
+        protocol,
+        Sizing {
+            max_cols: cols.clamp(1, 1000),
+            max_rows: cli.image_rows.max(1),
+        },
+    ))
 }
 
 /// 内容决定怎么输出。写入失败由 `Painter` 记录，这里不用返回错误。
@@ -148,6 +205,7 @@ fn emit(
     out: &mut Painter<&mut BufWriter<io::StdoutLock>>,
     cli: &Cli,
     hl: &Highlighter,
+    images: Option<&Images>,
     path: Option<&Path>,
     bytes: &[u8],
 ) {
@@ -163,7 +221,10 @@ fn emit(
     let first_line = text.lines().next().unwrap_or_default();
     match resolve(cli, hl, path, first_line) {
         Mode::Markdown => {
-            let rendered = markdown::Markdown::new(hl, !cli.no_color).render(text);
+            // 图片相对路径以 Markdown 文件所在目录为基准
+            let renderer = images.map(|images| images.for_file(base_dir(path)));
+            let rendered =
+                markdown::Markdown::new(hl, !cli.no_color, renderer.as_ref()).render(text);
             out.write_block(&rendered);
         }
         Mode::Syntax(syntax) => {

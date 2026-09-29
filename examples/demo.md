@@ -78,7 +78,15 @@ $ mcat -n src/main.rs
 
 ## 图片与脚注
 
-![架构图](https://example.com/arch.png "标题在这里")
+支持两种终端图形协议，Ghostty / kitty / WezTerm 走 Kitty 协议，
+iTerm2 走 iTerm2 内联图片。图片只会在终端里画出来，
+管道和重定向时退回文字占位。
+
+![渐变测试图](gradient.png)
+
+远程 URL 会下载并缓存到 `~/.cache/mcat`。
+
+![下载失败时](https://127.0.0.1:1/nope.png)
 
 脚注引用[^1] 和另一个[^note]。
 

@@ -274,6 +274,16 @@ impl<W: Write> Painter<W> {
         }
     }
 
+    /// 原样写入终端控制序列（比如图片协议的转义）。
+    /// 不计入显示宽度：这些序列在终端里不占字符格，而且长度和宽度无关。
+    pub fn write_control(&mut self, text: &str) {
+        self.begin_line();
+        self.raw(text);
+        self.cur = Style::PLAIN;
+        self.at_start = false;
+        self.line_empty = false;
+    }
+
     /// 原样写入一段已经渲染好的文本（可能含转义序列和多行）。
     /// 用于把子渲染结果贴回父渲染。
     pub fn write_raw(&mut self, text: &str) {

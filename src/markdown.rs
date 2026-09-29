@@ -4,6 +4,7 @@
 //! 再递归渲染成带 ANSI 样式的文本。代码块交给 syntect 上色。
 
 use crate::highlight::Highlighter;
+use crate::image::Renderer as ImageRenderer;
 use crate::style::{Color, Painter, Style, TextBuf, display_width};
 use pulldown_cmark::{
     Alignment as Align, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag,
@@ -370,21 +371,26 @@ struct Cfg {
     style: Style,
     /// 紧凑列表：块之间不额外留空行。
     tight: bool,
+    /// 表格单元格里不嵌图片：控制序列会撑破单元格。
+    in_table: bool,
 }
 
-pub struct Markdown<'a> {
+pub struct Markdown<'a, 'i> {
     hl: &'a Highlighter,
     color: bool,
     /// 脚注名字到编号的对应，渲染前按定义顺序填好。
     notes: HashMap<String, usize>,
+    /// 有值时把图片渲染成终端图形协议的控制序列。
+    images: Option<&'i ImageRenderer<'i>>,
 }
 
-impl<'a> Markdown<'a> {
-    pub fn new(hl: &'a Highlighter, color: bool) -> Self {
+impl<'a, 'i> Markdown<'a, 'i> {
+    pub fn new(hl: &'a Highlighter, color: bool, images: Option<&'i ImageRenderer<'i>>) -> Self {
         Markdown {
             hl,
             color,
             notes: HashMap::new(),
+            images,
         }
     }
 
@@ -485,6 +491,7 @@ impl<'a> Markdown<'a> {
                     prefix: "│ ".to_string(),
                     style: S_BORDER,
                     tight: false,
+                    in_table: false,
                 };
                 let mut sub = self.sub();
                 self.blocks(&mut sub, &node.children, &inner);
@@ -515,6 +522,7 @@ impl<'a> Markdown<'a> {
                         prefix: " ".repeat(display_width(&marker)),
                         style: Style::new(),
                         tight,
+                        in_table: false,
                     };
                     let mut sub = self.sub();
                     self.blocks(&mut sub, &item.children, &inner);
@@ -565,6 +573,7 @@ impl<'a> Markdown<'a> {
                     prefix: "  ".to_string(),
                     style: Style::new(),
                     tight: false,
+                    in_table: false,
                 };
                 self.blocks(p, &node.children, &inner);
             }
@@ -663,7 +672,15 @@ impl<'a> Markdown<'a> {
 
     fn cell(&self, cell: &Node, style: Style) -> String {
         let mut sub = self.sub();
-        self.inline(&mut sub, &cell.children, style, &Cfg::default());
+        self.inline(
+            &mut sub,
+            &cell.children,
+            style,
+            &Cfg {
+                in_table: true,
+                ..Default::default()
+            },
+        );
         sub.into_text().trim_end().to_string()
     }
 
@@ -734,6 +751,17 @@ impl<'a> Markdown<'a> {
                     }
                 }
                 Kind::Image(url) => {
+                    // 终端能显示就直接画出来，否则退回文字占位
+                    let drawn = if cfg.in_table {
+                        None
+                    } else {
+                        self.images.and_then(|images| images.render(url))
+                    };
+                    if let Some(sequence) = drawn {
+                        p.write_control(&sequence);
+                        p.newline();
+                        continue;
+                    }
                     let alt = plain_text(&node.children);
                     p.write(style.merge(S_IMAGE), "[image] ");
                     if alt.is_empty() {
@@ -780,7 +808,7 @@ fn collect_footnotes(node: &Node, out: &mut HashMap<String, usize>, counter: &mu
     }
 }
 
-impl Markdown<'_> {
+impl Markdown<'_, '_> {
     /// 脚注按定义顺序编号，找不到定义时退回原始名字。
     fn note_label(&self, name: &str) -> String {
         if name.is_empty() {
@@ -842,7 +870,7 @@ mod tests {
 
     /// 关掉颜色渲染成纯文本，方便直接比对排版。
     fn render(src: &str) -> String {
-        Markdown::new(highlighter(), false).render(src)
+        Markdown::new(highlighter(), false, None).render(src)
     }
 
     #[test]
@@ -953,7 +981,7 @@ mod tests {
     #[test]
     fn 开启颜色时确实写出转义序列() {
         assert!(
-            Markdown::new(highlighter(), true)
+            Markdown::new(highlighter(), true, None)
                 .render("# 标题\n")
                 .contains('\x1b')
         );
