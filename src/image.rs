@@ -320,9 +320,18 @@ fn pixel_budget(sizing: &Sizing, width: u32, height: u32) -> (u32, u32) {
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
-/// Kitty 图形协议：a=T 表示直接传输并显示，f=100 表示 PNG 格式，
-/// q=2 表示不要回执（mcat 不读 stdout 之外的输入，没法处理回执）。
-/// 载荷超过 4096 字节必须拆成多条，只有最后一条带 m=1。
+/// Kitty 图形协议。照规范
+/// <https://sw.kovidgoyal.net/kitty/graphics-protocol/> 实现：
+///
+/// - `a=T` 直接传输并显示，`f=100` 表示 PNG
+/// - `q=2` 抑制回执（mcat 不读 stdout 之外的输入，没法处理回执）
+/// - 载荷按 4096 字节分块；除最后一块外都带 `m=1`（后面还有数据），
+///   最后一块带 `m=0`
+/// - 完整控制数据只发第一块，后续块只带 `m`（规范明确要求）
+///
+/// 最后两条是最容易搞错的地方，弄错了终端就是什么都不显示：
+/// 终端在收齐并校验完整个序列之前不会显示任何东西，所以单块图片
+/// 也必须发 `m=0`；每块重复 `a=T` 则会被当成一次次的全新传输。
 fn kitty_sequence(url: &str, payload: &str, cols: usize, rows: usize) -> String {
     let id = image_id(url);
     let mut out = String::new();
@@ -330,11 +339,19 @@ fn kitty_sequence(url: &str, payload: &str, cols: usize, rows: usize) -> String 
     let total = payload.len().div_ceil(KITTY_CHUNK);
     for (i, chunk) in chunks.by_ref().enumerate() {
         let last = i + 1 == total;
-        // 控制数据里不能出现分号，分隔 payload 用的那个分号要放在最后
-        out.push_str(&format!(
-            "\x1b_Ga=T,f=100,i={id},q=2,c={cols},r={rows},m={};",
-            if last { 1 } else { 0 }
-        ));
+        // m=1 表示后面还有数据，m=0 表示这是最后一块。
+        // 弄反了终端会一直等下一块，图片永远不显示。
+        //
+        // 规范：完整控制数据只发第一块，后续块只能带 m（可选 q）。
+        // 每块都重复 a=T 会被当成一次次的全新传输。
+        if i == 0 {
+            out.push_str(&format!(
+                "\x1b_Ga=T,f=100,i={id},q=2,c={cols},r={rows},m={};",
+                u8::from(!last)
+            ));
+        } else {
+            out.push_str(&format!("\x1b_Gm={};", u8::from(!last)));
+        }
         out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
         out.push_str("\x1b\\");
     }
@@ -350,9 +367,11 @@ fn iterm2_sequence(payload: &str, cols: usize, rows: usize, size: usize) -> Stri
 }
 
 /// 同一个 URL 用同一个 id，避免图片被终端去重。
+/// 规范要求 id 不能是 0，所以把哈希落在 0 上的情况挪到 1。
 fn image_id(url: &str) -> u32 {
     let digest = Sha256::digest(url.as_bytes());
-    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+    let id = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    if id == 0 { 1 } else { id }
 }
 
 /// 只读图片头拿尺寸，不解码整张图。
@@ -508,8 +527,17 @@ mod tests {
         assert_eq!(seq.matches("\x1b_G").count(), 1);
         assert!(seq.starts_with("\x1b_Ga=T,f=100,"));
         assert!(seq.ends_with("\x1b\\"));
-        assert!(seq.contains("m=1;"));
         assert!(seq.contains("c=10,r=5"));
+    }
+
+    /// m=0 表示「这是最后一块」。单块图片也必须这么发：
+    /// 终端在收齐之前不显示，发 m=1 就等于让它一直等。
+    #[test]
+    fn kitty_单块必须标成最后一块() {
+        let payload = BASE64.encode([0u8; 100]);
+        let seq = kitty_sequence("x", &payload, 10, 5);
+        assert!(seq.contains("m=0;"), "{seq:?}");
+        assert!(!seq.contains("m=1;"), "{seq:?}");
     }
 
     #[test]
@@ -518,13 +546,45 @@ mod tests {
         let payload = BASE64.encode([0u8; 10000]);
         let seq = kitty_sequence("x", &payload, 10, 5);
         assert_eq!(seq.matches("\x1b_G").count(), 4);
-        assert_eq!(seq.matches("m=0;").count(), 3);
-        assert_eq!(seq.matches("m=1;").count(), 1);
+        // 除最后一块外都是 m=1
+        assert_eq!(seq.matches("m=1;").count(), 3);
+        assert_eq!(seq.matches("m=0;").count(), 1);
+        // m=0 只能出现在最后一条上
+        assert!(seq.rfind("m=0;").unwrap() > seq.rfind("m=1;").unwrap());
+    }
+
+    /// 规范：完整控制数据只发第一块，后续块只能带 m。
+    /// 每块都重复 a=T 会被当成一次次的全新传输。
+    #[test]
+    fn kitty_只有第一块带完整控制数据() {
+        let payload = BASE64.encode([0u8; 10000]);
+        let seq = kitty_sequence("x", &payload, 10, 5);
+        assert_eq!(seq.matches("a=T").count(), 1, "a=T 只能出现一次");
+        assert_eq!(seq.matches("f=100").count(), 1, "f=100 只能出现一次");
+        assert_eq!(seq.matches("i=").count(), 1, "i= 只能出现一次");
+        assert_eq!(seq.matches("c=").count(), 1, "c= 只能出现一次");
+        // 后续块只有 m
+        let followups: Vec<&str> = seq.split("\x1b_G").skip(2).collect();
+        assert!(!followups.is_empty());
+        for chunk in &followups {
+            let control = chunk.split(';').next().unwrap();
+            assert!(
+                control == "m=1" || control == "m=0",
+                "后续块只该有 m：{control}"
+            );
+        }
         // 每块的载荷都不超过上限
         for chunk in seq.split("\x1b\\").skip(1) {
             let payload = chunk.split_once(';').map(|(_, p)| p).unwrap_or_default();
             assert!(payload.len() <= KITTY_CHUNK, "块太长：{}", payload.len());
         }
+    }
+
+    /// 规范明确要求 id 不能是 0。
+    #[test]
+    fn 图片_id_不会是零() {
+        assert_ne!(image_id(""), 0);
+        assert_ne!(image_id("x.png"), 0);
     }
 
     #[test]
