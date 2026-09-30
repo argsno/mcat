@@ -1,0 +1,141 @@
+# 打 tag（如 v0.1.0）后自动出三件事：
+#   1. 构建 macOS（arm64/x86_64）和 Linux（x86_64/arm64）的 release 二进制
+#   2. 发布 GitHub Release，附 tar.gz 和对应的 .sha256
+#   3. 把 Formula/mcat.rb 模板的占位符填上 tag 和 sha256，推到 argsno/homebrew-tap
+#
+# tap 推送依赖两个一次性准备（见 CONTRIBUTING.md「发版」）：
+#   - 存在 argsno/homebrew-tap 仓库
+#   - mcat 仓库配置了 secret TAP_DEPLOY_KEY（tap 的部署密钥私钥，公钥在 tap 上勾了写权限）
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  BIN: mcat
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # 两个 mac 目标都在 arm64 机器上构建，x86_64 是交叉编译，Apple 工具链原生支持
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          # 用老一点的 ubuntu，绑住 glibc 版本，让二进制能在更老的发行版上跑
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tag 和 Cargo.toml 的版本对上
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} != Cargo.toml 的 v${cargo_version}"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # 交叉编译 arm64 Linux 只需要一个链接器：mcat 没有 C 依赖，
+      # 不需要架构相关的头文件和库
+      - name: 装 aarch64 交叉链接器
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: 打包
+        run: |
+          tarball="${BIN}-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          tar -czf "$tarball" -C "target/${{ matrix.target }}/release" "$BIN"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$tarball" > "$tarball.sha256"
+          else
+            shasum -a 256 "$tarball" > "$tarball.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: mcat-*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/mcat-*.tar.gz*
+          generate_release_notes: true
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: 生成 formula 并推到 tap
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          TAP_REPO: argsno/homebrew-tap
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          sha() { cut -d' ' -f1 "dist/mcat-${tag}-$1.tar.gz.sha256"; }
+
+          sed -e "s|__VERSION__|${tag#v}|g" \
+              -e "s|__TAG__|${tag}|g" \
+              -e "s|__SHA_ARM_MAC__|$(sha aarch64-apple-darwin)|g" \
+              -e "s|__SHA_ARM_LINUX__|$(sha aarch64-unknown-linux-gnu)|g" \
+              -e "s|__SHA_INTEL_MAC__|$(sha x86_64-apple-darwin)|g" \
+              -e "s|__SHA_INTEL_LINUX__|$(sha x86_64-unknown-linux-gnu)|g" \
+              Formula/mcat.rb > mcat.rb
+          ruby -c mcat.rb
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "${TAP_DEPLOY_KEY}" > ~/.ssh/tap_deploy_key
+          chmod 600 ~/.ssh/tap_deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_deploy_key -o IdentitiesOnly=yes"
+          git clone "git@github.com:${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp mcat.rb tap/Formula/mcat.rb
+          git -C tap config user.name "mcat-release-bot"
+          git -C tap config user.email "actions@users.noreply.github.com"
+          git -C tap add Formula/mcat.rb
+          if [ -z "$(git -C tap status --porcelain)" ]; then
+            echo "formula 没有变化，跳过推送"
+          else
+            git -C tap commit -m "mcat ${tag}"
+            git -C tap push
+          fi
