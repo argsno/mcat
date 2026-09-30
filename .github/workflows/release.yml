@@ -113,13 +113,16 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           sha() { cut -d' ' -f1 "dist/mcat-${tag}-$1.tar.gz.sha256"; }
 
-          sed -e "s|__VERSION__|${tag#v}|g" \
+          # 填占位符；模板开头的 TAP-HEADER 注释块只属于本仓库，换成 tap 自己的说明
+          sed -e '/^# TAP-HEADER-BEGIN/,/^# TAP-HEADER-END/d' \
+              -e "s|__VERSION__|${tag#v}|g" \
               -e "s|__TAG__|${tag}|g" \
               -e "s|__SHA_ARM_MAC__|$(sha aarch64-apple-darwin)|g" \
               -e "s|__SHA_ARM_LINUX__|$(sha aarch64-unknown-linux-gnu)|g" \
               -e "s|__SHA_INTEL_MAC__|$(sha x86_64-apple-darwin)|g" \
               -e "s|__SHA_INTEL_LINUX__|$(sha x86_64-unknown-linux-gnu)|g" \
-              Formula/mcat.rb > mcat.rb
+              Formula/mcat.rb | sed '/./,$!d' > mcat.body
+          { echo "# 由 mcat 仓库的 release workflow 自动生成，不要手动改。"; cat mcat.body; } > mcat.rb
           ruby -c mcat.rb
 
           mkdir -p ~/.ssh

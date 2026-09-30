@@ -1,7 +1,9 @@
+# TAP-HEADER-BEGIN
 # mcat 的 Homebrew formula 模板。
 # release workflow（.github/workflows/release.yml）把 __*__ 占位符填成真实值后
 # 推到 argsno/homebrew-tap 的 Formula/mcat.rb，不要直接用这份文件安装——
 # 占位符不是真实的 tag 和校验和。
+# TAP-HEADER-END
 class Mcat < Formula
   desc "A cat that renders Markdown in the terminal"
   homepage "https://github.com/argsno/mcat"
