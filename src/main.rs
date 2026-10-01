@@ -7,11 +7,13 @@
 mod highlight;
 mod image;
 mod markdown;
+mod mermaid;
 mod style;
 
 use clap::Parser;
 use highlight::Highlighter;
 use image::{Images, Protocol, Sizing};
+use mermaid::Theme;
 use std::fs;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -75,6 +77,10 @@ struct Cli {
     #[arg(long, value_name = "N")]
     image_cols: Option<usize>,
 
+    /// mermaid 图的配色：light 或 dark。默认 light
+    #[arg(long, value_name = "THEME", default_value = "light")]
+    mermaid_theme: String,
+
     /// 不输出内容，只报告图片功能的每一项决策，排查用
     #[arg(long)]
     check_images: bool,
@@ -105,6 +111,10 @@ fn main() -> ExitCode {
 
     // 图片只在终端里画得出来，管道和重定向就退回文字占位
     let images = setup_images(&cli, io::stdout().is_terminal());
+    // mermaid 图走图片链路，所以同样只在终端里画
+    let diagrams = images
+        .as_ref()
+        .map(|images| (mermaid::Renderer::new(mermaid_theme(&cli)), images.sizing()));
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
     let mut out = Painter::new(&mut writer)
@@ -113,21 +123,30 @@ fn main() -> ExitCode {
     let mut failed = false;
 
     if cli.files.is_empty() {
-        if let Err(e) = read_stdin(&mut out, &cli, &hl, images.as_ref()) {
+        if let Err(e) = read_stdin(&mut out, &cli, &hl, images.as_ref(), diagrams.as_ref()) {
             report(Path::new("-"), &e);
             failed = true;
         }
     } else {
         for path in &cli.files {
             if path == Path::new("-") {
-                if let Err(e) = read_stdin(&mut out, &cli, &hl, images.as_ref()) {
+                if let Err(e) = read_stdin(&mut out, &cli, &hl, images.as_ref(), diagrams.as_ref())
+                {
                     report(Path::new("-"), &e);
                     failed = true;
                 }
                 continue;
             }
             match fs::read(path) {
-                Ok(bytes) => emit(&mut out, &cli, &hl, images.as_ref(), Some(path), &bytes),
+                Ok(bytes) => emit(
+                    &mut out,
+                    &cli,
+                    &hl,
+                    images.as_ref(),
+                    diagrams.as_ref(),
+                    Some(path),
+                    &bytes,
+                ),
                 Err(e) => {
                     report(path, &e);
                     failed = true;
@@ -173,11 +192,30 @@ fn read_stdin(
     cli: &Cli,
     hl: &Highlighter,
     images: Option<&Images>,
+    diagrams: Option<&Diagrams<'_>>,
 ) -> io::Result<()> {
     let mut bytes = Vec::new();
     io::stdin().lock().read_to_end(&mut bytes)?;
-    emit(out, cli, hl, images, None, &bytes);
+    emit(out, cli, hl, images, diagrams, None, &bytes);
     Ok(())
+}
+
+/// mermaid 渲染器，配上它该用的显示尺寸上限。
+type Diagrams<'a> = (mermaid::Renderer, Sizing);
+
+/// 解析 `--mermaid-theme`。认不出来时说一句，然后按默认值走——
+/// 一个配色选错不该让整个文件渲染不出来。
+fn mermaid_theme(cli: &Cli) -> Theme {
+    match Theme::parse(&cli.mermaid_theme) {
+        Some(theme) => theme,
+        None => {
+            eprintln!(
+                "mcat: 未知 mermaid 主题 {:?}，可选：light、dark",
+                cli.mermaid_theme
+            );
+            Theme::default()
+        }
+    }
 }
 
 /// 报告图片链路上每一环的决策。图片没显示出来时，用它定位卡在哪一步。
@@ -324,6 +362,54 @@ fn check_images(cli: &Cli) -> ExitCode {
                 Err(reason) => println!("  结论      ✗ {reason} -> 退回文字占位"),
             }
         }
+
+        // mermaid 图走同一条链路，只是字节来自渲染而不是读文件
+        if !standalone {
+            let theme = mermaid_theme(cli);
+            let sizing = images.sizing();
+            let blocks = markdown::mermaid_sources(&source);
+            if !blocks.is_empty() {
+                println!("\nmermaid 主题  {}", theme.name());
+            }
+            let renderer = mermaid::Renderer::new(theme);
+            for block in blocks {
+                total += 1;
+                let first = block.lines().next().unwrap_or_default();
+                println!("\n[diagram] {first}");
+                match renderer.prepare(&block, &sizing) {
+                    Ok(info) => {
+                        ok += 1;
+                        println!("  来源      源码（{} 字节）渲染", block.len());
+                        println!(
+                            "  尺寸      {}x{} -> {}x{} 像素",
+                            info.source_pixel.0,
+                            info.source_pixel.1,
+                            info.encoded_pixel.0,
+                            info.encoded_pixel.1
+                        );
+                        println!("  显示      估算 {}x{} 格", info.cells.0, info.cells.1);
+                        // 编码交给图片管线，和普通图片走同一条路。用同一份
+                        // Prepared，避免为了报告再渲染一遍。
+                        let encoder = images.for_file(base_dir(Some(path)));
+                        let payload = info.png.len();
+                        match encoder.render_png(&mermaid::identity(&block), info.png) {
+                            Some(sequence) => {
+                                println!(
+                                    "  载荷      {payload} 字节 -> base64 {} 字符",
+                                    payload.div_ceil(3) * 4
+                                );
+                                println!("  序列      {}", preview(&sequence));
+                                println!("  结论      ✓ 会输出图形序列");
+                            }
+                            None => {
+                                println!("  结论      ✗ 编码成控制序列失败 -> 退回源码");
+                            }
+                        }
+                    }
+                    Err(reason) => println!("  结论      ✗ {reason} -> 退回源码"),
+                }
+            }
+        }
     }
     println!("\n共 {total} 张图，{ok} 张会画出来");
     ExitCode::SUCCESS
@@ -393,6 +479,7 @@ fn emit(
     cli: &Cli,
     hl: &Highlighter,
     images: Option<&Images>,
+    diagrams: Option<&Diagrams<'_>>,
     path: Option<&Path>,
     bytes: &[u8],
 ) {
@@ -433,8 +520,13 @@ fn emit(
         Mode::Markdown => {
             // 图片相对路径以 Markdown 文件所在目录为基准
             let renderer = images.map(|images| images.for_file(base_dir(path)));
-            let rendered =
-                markdown::Markdown::new(hl, !cli.no_color, renderer.as_ref()).render(text);
+            let rendered = markdown::Markdown::new(
+                hl,
+                !cli.no_color,
+                renderer.as_ref(),
+                diagrams.map(|(renderer, sizing)| (renderer, *sizing)),
+            )
+            .render(text);
             out.write_block(&rendered);
         }
         Mode::Syntax(syntax) => {

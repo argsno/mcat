@@ -26,7 +26,7 @@
 |---|---|---|
 | **Markdown 渲染** | `mcat README.md` | 标题分级配色、列表、引用、表格、任务清单、脚注，按 CommonMark 渲染 |
 | **语法高亮** | `mcat src/main.rs` | 代码块和其他源码文件按语言上色，[syntect](https://github.com/trishume/syntect) 主题，纯 Rust 后端 |
-| **直接看图** | `mcat examples/gradient.png` | Kitty 图形协议 / iTerm2 内联图片，图片直接画在终端里；认文件内容，不认扩展名 |
+| **看图** | `mcat examples/gradient.png` | Kitty 图形协议 / iTerm2 内联图片，图片直接画在终端里；认文件内容，不认扩展名 |
 
 ```console
 $ mcat --image-rows 12 shot.jpg   # 限制图片高度
@@ -34,6 +34,23 @@ $ git log -p | mcat               # 标准输入按 Markdown 处理
 $ curl … | mcat -l json           # 强制指定语言
 $ mcat --no-render README.md      # 完全等同 cat
 ```
+
+## mermaid 图
+
+` ```mermaid ` 代码块直接画成图，和图片走同一条链路：Kitty / iTerm2 图形协议，
+[纯 Rust 渲染](https://github.com/Latias94/merman)，不需要 Node.js。
+
+```mermaid
+flowchart LR
+  A[读文件] --> B{是 Markdown?}
+  B -->|是| C[解析成块树]
+  B -->|否| D[语法高亮]
+  C --> E[渲染成 ANSI]
+  D --> E
+```
+
+图的明暗配色跟着终端背景走，认不出来就默认亮色。画不出来（协议不支持、源码有语法错、
+图类型 merman 不支持）就退回显示源码，不报错。
 
 ## 输出长什么样
 
@@ -71,7 +88,13 @@ cat 输出字节流，mcat 输出渲染后的样式给人看。要字节流时�
 **图片没显示出来？**
 
 用 `mcat --check-images` 排查：不输出正文，把协议从哪猜的、文件找没找到、格式、最终占多少
-字符格、载荷多大，一路打出来。任何一环走不通都退回 `[image] 说明 (路径)` 的文字占位，不会报错。
+字符格、载荷多大，一路打出来。mermaid 图也一起查。任何一环走不通都退回文字占位，不会报错。
+
+**mermaid 图为什么没画出来？**
+
+`--check-images` 会报出卡在哪一步：图类型认不认得、SVG 出没出、光栅化有没有失败。
+多数情况是 stdout 不是终端（管道、重定向），或者终端不支持图形协议——这时图退回源码。
+配色不对用 `--mermaid-theme dark`。
 
 **哪些终端能画图？**
 

@@ -93,3 +93,22 @@ iTerm2 走 iTerm2 内联图片。图片只会在终端里画出来，
 [^1]: 这是第一个脚注。
 
 [^note]: 这是第二个脚注。
+
+## mermaid 图
+
+```mermaid
+flowchart LR
+  A[读文件] --> B[判断类型]
+  B -->|Markdown| C[渲染块树]
+  B -->|源码| D[语法高亮]
+  C --> E[ANSI 输出]
+  D --> E
+```
+
+时序：
+
+```mermaid
+sequenceDiagram
+  User->>mcat: mcat README.md
+  mcat-->>User: 渲染后的文本
+```

@@ -25,8 +25,14 @@ const MAX_DOWNLOAD: u64 = 20 * 1024 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// 下载超时。
 const TIMEOUT: Duration = Duration::from_secs(30);
-/// 终端里一个字符格大约的高宽比，用来把像素尺寸换算成行列数。
-const CELL_RATIO: f64 = 0.5;
+/// 一个字符格按 Retina 算的物理像素宽高。编码到这个分辨率就够了。
+const CELL_W: usize = 16;
+const CELL_H: usize = 32;
+/// 字符格的高宽比，用来把像素尺寸换算成行列数。
+///
+/// 字符格是竖着的（宽 16 高 32），所以一格高的像素数是一格宽的两倍。
+/// 宽高比必须大于 1，写成宽除以高会让所有图片都算小四倍。
+const CELL_ASPECT: f64 = CELL_H as f64 / CELL_W as f64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
@@ -227,18 +233,45 @@ impl Renderer<'_> {
         normalize(&self.resolve(url)).to_string_lossy().into_owned()
     }
 
+    /// 直接编码已经在内存里的图片字节（mermaid 图走这条路）。
+    /// `identity` 决定终端图片 id，所以同一张图必须每次算出同一个值。
+    pub fn render_png(&self, identity: &str, png: Vec<u8>) -> Option<String> {
+        if let Some(cached) = self.seen.borrow().get(identity) {
+            return cached.clone();
+        }
+        let sequence = self
+            .encode(identity, &png, None, false)
+            .ok()
+            .map(|p| p.sequence);
+        self.seen
+            .borrow_mut()
+            .insert(identity.to_string(), sequence.clone());
+        sequence
+    }
+
     /// 图片渲染的每一步。`Err` 里是给用户看的原因。
     pub fn prepare(&self, url: &str) -> Result<Prepared, String> {
         let (data, local_path, from_cache) = self.load(url)?;
+        self.encode(&self.identity(url), &data, local_path, from_cache)
+    }
+
+    /// 转码、降采样、算尺寸、编码成控制序列。
+    fn encode(
+        &self,
+        identity: &str,
+        data: &[u8],
+        local_path: Option<PathBuf>,
+        from_cache: bool,
+    ) -> Result<Prepared, String> {
         let (payload, format, transcoded, source_pixel, encoded_pixel, downscaled) =
-            self.convert(&data)?;
+            self.convert(data)?;
         let fit = self.sizing.fit(encoded_pixel.0, encoded_pixel.1);
         if fit.value == 0 {
             return Err("尺寸算出来是 0".to_string());
         }
         let encoded = BASE64.encode(&payload);
         let sequence = match self.shared.protocol {
-            Protocol::Kitty => kitty_sequence(&self.identity(url), &encoded, fit),
+            Protocol::Kitty => kitty_sequence(identity, &encoded, fit),
             // iTerm2 那边靠 preserveAspectRatio，同时给两个维度
             Protocol::Iterm2 => iterm2_sequence(&encoded, fit.cols, fit.rows, payload.len()),
         };
@@ -354,9 +387,14 @@ impl Renderer<'_> {
 }
 
 impl Sizing {
+    /// 字符格换算成像素。一个字符格按 Retina 算大约 16×32 物理像素。
+    pub fn pixel_box(&self, cols: usize, rows: usize) -> (u32, u32) {
+        ((cols * CELL_W) as u32, (rows * CELL_H) as u32)
+    }
+
     /// 算出该发给终端的尺寸约束。
     ///
-    /// 字符格不是正方形（实测约 1:2），所以高宽比要换算成行列比。
+    /// 字符格不是正方形（宽 16 高 32），所以高宽比要换算成行列比。
     /// 这个估算只用来**决定发哪个维度**；另一个维度交给终端按真实字符格算，
     /// 所以估得不准也不会让图片变形。
     pub fn fit(&self, width: u32, height: u32) -> Fit {
@@ -368,13 +406,15 @@ impl Sizing {
                 rows: 0,
             };
         }
+        // 图片的高宽比先换成字符格的高宽比：一个格高是一格宽的两倍，
+        // 所以格数比像素比要再除以两倍
         let aspect = f64::from(height) / f64::from(width);
         let mut cols = self.max_cols;
-        let mut rows = ((cols as f64 * aspect) / CELL_RATIO).round() as usize;
+        let mut rows = ((cols as f64 * aspect) / CELL_ASPECT).round() as usize;
         if rows > self.max_rows {
             // 太高了，改为按高度约束，列数由终端算
             rows = self.max_rows;
-            cols = ((rows as f64 * CELL_RATIO) / aspect).round() as usize;
+            cols = ((rows as f64 * CELL_ASPECT) / aspect).round() as usize;
             return Fit {
                 axis: Axis::Rows,
                 value: rows.max(1),
@@ -395,7 +435,7 @@ impl Sizing {
 /// 这里用的是估算值，估偏一点只影响文件大小，不影响显示比例。
 fn pixel_budget(sizing: &Sizing, width: u32, height: u32) -> (u32, u32) {
     let fit = sizing.fit(width, height);
-    ((fit.cols * 16) as u32, (fit.rows * 32) as u32)
+    sizing.pixel_box(fit.cols, fit.rows)
 }
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
@@ -460,7 +500,7 @@ fn image_id(url: &str) -> u32 {
 }
 
 /// 只读图片头拿尺寸，不解码整张图。
-fn dimensions(data: &[u8]) -> Option<(u32, u32)> {
+pub fn dimensions(data: &[u8]) -> Option<(u32, u32)> {
     ImageReader::new(std::io::Cursor::new(data))
         .with_guessed_format()
         .ok()?
@@ -594,9 +634,34 @@ mod tests {
     #[test]
     fn 缩放保持宽高比() {
         let fit = sizing(100, 100).fit(400, 400);
-        // 方形图片：字符格是 1:2，所以行数是列数的两倍
-        assert_eq!(fit.rows, fit.cols * 2);
+        // 方形图片：字符格高是宽的两倍，所以行数是列数的一半
+        assert_eq!(fit.rows * 2, fit.cols);
         assert!(fit.cols <= 100 && fit.rows <= 100);
+    }
+
+    /// 字符格高宽比必须按「一格高的像素 / 一格宽的像素」算。
+    ///
+    /// 写反了（拿宽除以高）会让所有图片都算小四倍：一张 4000×3000 的照片
+    /// 在 80×20 格里只能摆 13×20，实际能摆 53×19。
+    #[test]
+    fn 尺寸估算和真实字符格一致() {
+        // 横向照片 4000×3000 放进 80×20 格：
+        // 铺满 80 列需要 30 行（1280 像素宽 * 0.75 / 32），超出 20 行，
+        // 所以改为按行数约束，20 行高对应 53 列宽
+        let fit = sizing(80, 20).fit(4000, 3000);
+        assert_eq!(fit.axis, Axis::Rows);
+        assert_eq!(fit.rows, 20);
+        assert_eq!(fit.cols, 53);
+    }
+
+    #[test]
+    fn 竖长流程图不会被压成一列() {
+        // mermaid 竖长流程图的实际尺寸量级
+        let fit = sizing(80, 20).fit(290, 460);
+        assert_eq!(fit.axis, Axis::Rows);
+        assert_eq!(fit.rows, 20);
+        // 20 格高 = 640 像素，640 / 1.586 / 16 ≈ 25 格宽
+        assert_eq!(fit.cols, 25);
     }
 
     #[test]
@@ -759,7 +824,7 @@ mod resize_tests {
     #[test]
     fn 大图按显示尺寸降采样() {
         // 渐变图，PNG 压不动，才看得出体积变化
-        let mut big = image::RgbaImage::new(600, 400);
+        let mut big = image::RgbaImage::new(1600, 1200);
         for (x, y, pixel) in big.enumerate_pixels_mut() {
             *pixel = image::Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255]);
         }
@@ -770,13 +835,25 @@ mod resize_tests {
             max_cols: 20,
             max_rows: 20,
         };
-        let budget = pixel_budget(&sizing, 600, 400);
+        let budget = pixel_budget(&sizing, 1600, 1200);
         let (out, w, h) = to_png(&png, budget).unwrap();
         assert!(
             w <= budget.0 && h <= budget.1,
             "{w}x{h} 超出预算 {budget:?}"
         );
         assert!(out.len() < original / 4, "{} vs {original}", out.len());
+    }
+
+    /// 降采样预算和显示尺寸是同一个口径：一格宽 16 像素，一格高 32 像素。
+    #[test]
+    fn 降采样预算按字符格算() {
+        let sizing = Sizing {
+            max_cols: 80,
+            max_rows: 20,
+        };
+        // 1600×1200 铺满 80 列要 30 行，超了；改按 20 行算，列数收窄
+        let budget = pixel_budget(&sizing, 1600, 1200);
+        assert_eq!(budget, (53 * 16, 20 * 32));
     }
 
     /// 降采样要保持宽高比。
@@ -851,8 +928,9 @@ mod report_tests {
         assert_eq!(info.source_pixel, (48, 24));
         assert!(!info.transcoded, "PNG 不该转码");
         assert_eq!(info.chunks, 1);
-        assert_eq!(info.axis, Axis::Rows);
-        assert_eq!(info.cells, (20, 20));
+        // 48×24 铺满 80 列只要 10 行，20 行的上限用不满，所以按列数约束
+        assert_eq!(info.axis, Axis::Columns);
+        assert_eq!(info.cells, (80, 20));
         assert!(info.sequence.starts_with("\x1b_G"));
         assert_eq!(info.sequence.matches("\x1b_G").count(), info.chunks);
     }
