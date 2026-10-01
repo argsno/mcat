@@ -8,6 +8,9 @@ license = "MIT"
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# mermaid 图：解析、布局、光栅化成 PNG。纯 Rust，无 C 依赖。
+# 只开 render + raster，不开 ascii —— 框线字符渲染的效果不足以进终端正文。
+merman = { version = "0.7.0", features = ["render", "raster"] }
 pulldown-cmark = "0.13.4"
 sha2 = "0.11.0"
 # 纯 Rust 的 regex 后端，避免 onig(C) 依赖

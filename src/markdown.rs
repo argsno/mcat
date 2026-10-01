@@ -4,7 +4,8 @@
 //! 再递归渲染成带 ANSI 样式的文本。代码块交给 syntect 上色。
 
 use crate::highlight::Highlighter;
-use crate::image::Renderer as ImageRenderer;
+use crate::image::{Renderer as ImageRenderer, Sizing};
+use crate::mermaid::Renderer as MermaidRenderer;
 use crate::style::{Color, Painter, Style, TextBuf, display_width};
 use pulldown_cmark::{
     Alignment as Align, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag,
@@ -42,6 +43,8 @@ const S_IMAGE: Style = Style::new().dim();
 const CODE_INDENT: &str = "  ";
 /// 水平分隔线的宽度。
 const RULE_WIDTH: usize = 60;
+/// 认成 mermaid 图的代码块语言标记。
+const MERMAID_LANG: &str = "mermaid";
 
 fn heading_style(level: u8) -> Style {
     match level {
@@ -369,6 +372,23 @@ pub fn image_urls(src: &str) -> Vec<String> {
     out
 }
 
+/// 按出现顺序收集文档里所有 ```mermaid 代码块的源码，供 `--check-images` 报告。
+pub fn mermaid_sources(src: &str) -> Vec<String> {
+    fn walk(node: &Node, out: &mut Vec<String>) {
+        if let Kind::CodeBlock(Some(lang)) = &node.kind
+            && lang == MERMAID_LANG
+        {
+            out.push(node.text.clone());
+        }
+        for child in &node.children {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&parse(src), &mut out);
+    out
+}
+
 // ---------------------------------------------------------------- 渲染
 
 /// 列表标记：写在父层前缀之后，并顶掉首行对应的缩进。
@@ -397,15 +417,23 @@ pub struct Markdown<'a, 'i> {
     notes: HashMap<String, usize>,
     /// 有值时把图片渲染成终端图形协议的控制序列。
     images: Option<&'i ImageRenderer<'i>>,
+    /// 有值时把 ```mermaid 代码块画成图。渲染器和它该用的尺寸上限。
+    diagrams: Option<(&'i MermaidRenderer, Sizing)>,
 }
 
 impl<'a, 'i> Markdown<'a, 'i> {
-    pub fn new(hl: &'a Highlighter, color: bool, images: Option<&'i ImageRenderer<'i>>) -> Self {
+    pub fn new(
+        hl: &'a Highlighter,
+        color: bool,
+        images: Option<&'i ImageRenderer<'i>>,
+        diagrams: Option<(&'i MermaidRenderer, Sizing)>,
+    ) -> Self {
         Markdown {
             hl,
             color,
             notes: HashMap::new(),
             images,
+            diagrams,
         }
     }
 
@@ -430,6 +458,18 @@ impl<'a, 'i> Markdown<'a, 'i> {
 
     fn sub(&self) -> Painter<TextBuf> {
         Painter::new(TextBuf::new()).with_color(self.color)
+    }
+
+    /// mermaid 源码 → 终端图形协议的控制序列。
+    ///
+    /// 两步：先渲染成 PNG，再交给图片管线编码。和图片共用同一套
+    /// 分块、尺寸和 id 计算，所以行为一致。任何一步走不通返回 `None`，
+    /// 调用方退回显示源码。
+    fn diagram(&self, source: &str) -> Option<String> {
+        let (renderer, sizing) = self.diagrams?;
+        let png = renderer.png(source, &sizing)?;
+        self.images?
+            .render_png(&crate::mermaid::identity(source), png)
     }
 
     /// 行首补上当前层的前缀。
@@ -474,6 +514,18 @@ impl<'a, 'i> Markdown<'a, 'i> {
             Kind::CodeBlock(lang) => {
                 if spaced {
                     p.blank_line();
+                }
+                // mermaid 图画不出来时（协议不支持、终端不是终端、源码有语法错）
+                // 退回显示源码，和图片退回文字占位是同一个策略。
+                // 表格单元格里不嵌图：控制序列会撑破单元格。
+                if lang.as_deref() == Some(MERMAID_LANG)
+                    && !cfg.in_table
+                    && let Some(sequence) = self.diagram(&node.text)
+                {
+                    self.open(p, cfg);
+                    p.write_control(&sequence);
+                    p.newline();
+                    return;
                 }
                 // 认不出语言时保持原样，没必要把每个字符都涂成同一个颜色
                 match lang.as_deref().and_then(|name| self.hl.by_name(name)) {
@@ -885,7 +937,7 @@ mod tests {
 
     /// 关掉颜色渲染成纯文本，方便直接比对排版。
     fn render(src: &str) -> String {
-        Markdown::new(highlighter(), false, None).render(src)
+        Markdown::new(highlighter(), false, None, None).render(src)
     }
 
     #[test]
@@ -947,6 +999,56 @@ mod tests {
     }
 
     #[test]
+    fn 收集文档里的_mermaid_源码() {
+        let src = "\
+```mermaid
+flowchart TD
+  A --> B
+```
+
+普通代码块不算：
+
+```
+echo hi
+```
+
+再来一张：
+
+```mermaid
+sequenceDiagram
+  A->>B: hi
+```
+";
+        let found = mermaid_sources(src);
+        assert_eq!(found.len(), 2);
+        assert!(found[0].contains("flowchart TD"));
+        assert!(found[1].contains("sequenceDiagram"));
+    }
+
+    /// 表格单元格里的 mermaid 不能变成图：控制序列会撑破单元格。
+    /// （表格里的代码块在 CommonMark 里是行内代码，本来就拿不到代码块节点，
+    /// 这条测试守住的是「万一以后解析变了也不会漏出控制序列」。）
+    #[test]
+    fn 表格里不嵌_mermaid_图() {
+        let src = "| 图 |\n|---|\n| `mermaid` |\n";
+        let out = Markdown::new(highlighter(), false, None, None).render(src);
+        assert!(!out.contains('\u{1b}'), "表格里漏出了控制序列：{out:?}");
+    }
+
+    /// mermaid 画不出来时必须退回源码，不能把内容吞掉。
+    #[test]
+    fn 没有渲染器时_mermaid_退回源码() {
+        let src = "```mermaid\nflowchart TD\n  A --> B\n```\n";
+        let out = Markdown::new(highlighter(), false, None, None).render(src);
+        assert!(out.contains("flowchart TD"), "{out:?}");
+        assert!(out.contains("A --> B"), "{out:?}");
+        assert!(
+            !out.contains('\u{1b}'),
+            "没有图片管线就不该有控制序列：{out:?}"
+        );
+    }
+
+    #[test]
     fn 表格按显示宽度对齐且尊重对齐方式() {
         let out = render("| 名字 | 值 |\n|---|---:|\n| 中文 | 1 |\n");
         let lines: Vec<&str> = out.lines().collect();
@@ -996,7 +1098,7 @@ mod tests {
     #[test]
     fn 开启颜色时确实写出转义序列() {
         assert!(
-            Markdown::new(highlighter(), true, None)
+            Markdown::new(highlighter(), true, None, None)
                 .render("# 标题\n")
                 .contains('\x1b')
         );

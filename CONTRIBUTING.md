@@ -28,6 +28,7 @@ $ mcat examples/demo.md
 | `src/markdown.rs` | Markdown 解析成块/行内树，再渲染成 ANSI 文本 |
 | `src/highlight.rs` | syntect 封装：按语言逐行上色 |
 | `src/image.rs` | 图片协议、下载缓存、降采样转码 |
+| `src/mermaid.rs` | mermaid 源码 → SVG → PNG |
 | `src/style.rs` | 样式、显示宽度计算、带状态的输出器 |
 
 `src/style.rs` 里的 `Painter` 只在样式变化时写转义序列，并在每行结束时复位，
@@ -63,6 +64,38 @@ $ mcat examples/demo.md
 - **表格里不嵌图片。** 控制序列会撑破单元格，那里也退回文字占位。
 - **标准输入不参与图片识别。** `git log -p | mcat` 的行为不能变。
 
+## mermaid 图的取舍
+
+` ```mermaid ` 代码块渲染成 PNG，之后完全走图片链路——同一套分块、尺寸、id 计算。
+所以「只在终端里画图」「任何一环走不通退回文字」这些规则对图同样成立，不需要额外机制。
+
+- **走 PNG 而不是框线字符。** merman 有一套 ASCII 渲染器（`ascii` feature），纯文本能进管道、
+  能被 grep，但实测质量不够：圆角矩形的边框会叠两层，子程序节点左右多出竖线，
+  每行都带行尾空白，`flowchart LR` 六个节点就 115 列宽（mcat 不折行，直接溢出）。
+  PNG 的输出质量好得多，代价是只在支持图形协议的终端里有图。
+- **渲染成 PNG 再交给图片管线，不要各写一套。** 两处自己算尺寸就会算出不一样的结果，
+  图片 id 也对不上（终端会因此反复画同一张图）。
+- **放大倍数自己算。** merman 的 `fit_to` 只缩不放，但 mermaid 的节点和字号是固定 CSS 像素，
+  天然远小于 Retina 分辨率——不放大就是一堆糊字。所以按显示预算算 `contain` 的倍数，
+  小图放大、大图缩小，放大后总归落在预算里。
+- **`size_limit` 要压住。** merman 默认放到 8192×8192（约 270 MB 显存），对 `cat` 太宽了。
+  按显示预算封顶，防止一张病态的图吃满内存。
+- **缓存按源码哈希，失败也缓存。** 一份文档里同一张图出现多次很常见；重试一百次也是同样的失败，
+  不该每次都重新解析。
+- **只用 `render` + `raster` 两个 feature。** 默认 feature 是空的，但 `ascii`、`pdf`、
+  `eframe`（GUI）都在可选列表里，别顺手开。
+- **CJK 靠系统字体。** 光栅化时 fontdb 扫系统字体，中文标签需要系统装了中文字体。
+  没装的话标签画不出来，但流程和箭头还在。
+
+## 图片尺寸估算
+
+字符格是竖着的：按 Retina 约 16 像素宽、32 像素高。所以高宽比是 2，**不是 0.5**。
+
+`Sizing::fit` 里 `rows = cols * (h/w) / CELL_ASPECT`，`CELL_ASPECT = CELL_H / CELL_W = 2`。
+写成 `CELL_W / CELL_H`（也就是拿宽除以高）会让所有图片都算小四倍：一张 4000×3000 的照片
+在 80×20 的格里只能摆 13×20，实际能摆 53×19。这个常数错了图片还能显示，只是小得离谱，
+很容易被当成「终端就这样」放过去。
+
 调试图片问题时，除了 `mcat --check-images`，还可以拿规范里的参考实现交叉验证：
 
 ```console
@@ -82,15 +115,24 @@ $ sh examples/send-png.sh examples/gradient.png
 | `ureq` | 下载远程图片（rustls，无 C 依赖） |
 | `terminal_size` | 终端宽度 |
 | `base64` | 图形协议载荷编码 |
-| `sha2` | 远程图片缓存键 |
+| `sha2` | 远程图片缓存键、mermaid 图 id |
 | `unicode-width` | 东亚宽度计算 |
 | `clap` | 命令行解析 |
+| `merman` | mermaid 图解析、布局、光栅化 |
 
-依赖从 4 个涨到 9 个（65 个传递依赖），冷构建从 6 秒涨到 12 秒。
-`image` 和 `ureq` 是图片功能带来的，是这个工具里最重的两个依赖。
+依赖从 4 个涨到 10 个（256 个传递依赖），冷构建从 6 秒涨到 74 秒。
+
+`image` 和 `ureq` 是图片功能带来的，`merman` 是 mermaid 图带来的。`merman` 会带进
+resvg、tiny-skia、fontdb（找系统字体）和 lalrpop（构建期生成解析器）——它是传递依赖里
+最重的一个，也是冷构建时间翻倍的原因。
 
 加新依赖前先掂量一下冷构建时间，并保持「纯 Rust、无 C 依赖」这条约束——
-`syntect` 特意选了 fancy-regex 而不是默认的 onig，`ureq` 特意关了 default-features 只留 rustls。
+`syntect` 特意选了 fancy-regex 而不是默认的 onig，`ureq` 特意关了 default-features 只留 rustls，
+`merman` 没有 C 依赖但会让构建慢一个数量级，所以只开了它需要的 `render` + `raster`
+两个 feature（`ascii` 那套框线字符渲染器用不上）。
+
+「无 C 依赖」这条仍然成立：`core-foundation-sys`（merman 经 chrono 带进来的）只有 extern 声明，
+没有 build.rs，不编译 C 代码；唯一拉 `cc` 的是 `ring`，而它本来就在 `ureq` 的链路上。
 
 ## 发版
 
