@@ -6,7 +6,7 @@
 use crate::highlight::Highlighter;
 use crate::image::{Renderer as ImageRenderer, Sizing};
 use crate::mermaid::Renderer as MermaidRenderer;
-use crate::style::{Color, Painter, Style, TextBuf, display_width};
+use crate::style::{Color, Painter, Style, TextBuf, display_width, wrap_styled};
 use pulldown_cmark::{
     Alignment as Align, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag,
 };
@@ -419,6 +419,8 @@ pub struct Markdown<'a, 'i> {
     images: Option<&'i ImageRenderer<'i>>,
     /// 有值时把 ```mermaid 代码块画成图。渲染器和它该用的尺寸上限。
     diagrams: Option<(&'i MermaidRenderer, Sizing)>,
+    /// 终端宽度：表格比它宽时把单元格内容折行。管道里给 `None`，不折行。
+    width: Option<usize>,
 }
 
 impl<'a, 'i> Markdown<'a, 'i> {
@@ -434,7 +436,14 @@ impl<'a, 'i> Markdown<'a, 'i> {
             notes: HashMap::new(),
             images,
             diagrams,
+            width: None,
         }
+    }
+
+    /// 告诉渲染器终端有多宽，放不下的表格会折行。不给就一律不折。
+    pub fn with_width(mut self, width: Option<usize>) -> Self {
+        self.width = width;
+        self
     }
 
     pub fn render(&mut self, src: &str) -> String {
@@ -715,8 +724,8 @@ impl<'a, 'i> Markdown<'a, 'i> {
         let columns = head_text
             .len()
             .max(body.first().map_or(0, |(cells, _)| cells.len()));
-        let mut widths = vec![0usize; columns];
-        for (i, w) in widths.iter_mut().enumerate() {
+        let mut natural = vec![0usize; columns];
+        for (i, w) in natural.iter_mut().enumerate() {
             let mut width = head_text.get(i).map_or(0, |t| display_width(t));
             for (cells, _) in &body {
                 if let Some(t) = cells.get(i) {
@@ -725,14 +734,24 @@ impl<'a, 'i> Markdown<'a, 'i> {
             }
             *w = width.max(1);
         }
+        // 放不下就把列压窄，单元格内容折行；放得下时宽度不变
+        let widths = fit_widths(&natural, available(self.width, cfg, columns));
+        let wrap = |cells: &[String]| -> Vec<Vec<String>> {
+            cells
+                .iter()
+                .enumerate()
+                .map(|(i, text)| wrap_styled(text, widths.get(i).copied().unwrap_or(1)))
+                .collect()
+        };
+        let head_cells = wrap(&head_text);
 
         self.border(p, cfg, "┌", "┬", "┐", &widths);
         if !header.is_empty() {
-            self.row(p, cfg, &head_text, &head_align, &widths);
+            self.row(p, cfg, &head_cells, &head_align, &widths);
             self.border(p, cfg, "├", "┼", "┤", &widths);
         }
         for (cells, aligns) in &body {
-            self.row(p, cfg, cells, aligns, &widths);
+            self.row(p, cfg, &wrap(cells), aligns, &widths);
         }
         self.border(p, cfg, "└", "┴", "┘", &widths);
     }
@@ -773,24 +792,31 @@ impl<'a, 'i> Markdown<'a, 'i> {
         p.newline();
     }
 
+    /// 写一行表格内容。单元格折成多行时逐行写出，每行都补齐到列宽。
     fn row(
         &self,
         p: &mut Painter<TextBuf>,
         cfg: &Cfg,
-        cells: &[String],
+        cells: &[Vec<String>],
         aligns: &[Align],
         widths: &[usize],
     ) {
-        self.open(p, cfg);
-        p.write(S_BORDER, "│");
-        for (i, w) in widths.iter().enumerate() {
-            let align = aligns.get(i).copied().unwrap_or(Align::None);
-            let text = pad(cells.get(i).map(String::as_str).unwrap_or(""), *w, align);
-            // 单元格自己带样式（表头加粗），整体左移一格对齐
-            p.write_raw(&text);
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        for line in 0..height {
+            self.open(p, cfg);
             p.write(S_BORDER, "│");
+            for (i, w) in widths.iter().enumerate() {
+                let align = aligns.get(i).copied().unwrap_or(Align::None);
+                let text = cells
+                    .get(i)
+                    .and_then(|lines| lines.get(line))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                p.write_raw(&pad(text, *w, align));
+                p.write(S_BORDER, "│");
+            }
+            p.newline();
         }
-        p.newline();
     }
 
     fn inline(&self, p: &mut Painter<TextBuf>, nodes: &[Node], style: Style, cfg: &Cfg) {
@@ -903,6 +929,43 @@ fn plain_text(nodes: &[Node]) -> String {
     out
 }
 
+/// 表格能用的内容宽度：终端宽度减掉边框、内边距和行首前缀。
+/// 没有终端宽度（管道、重定向）时返回 `usize::MAX`，也就是不折行。
+fn available(width: Option<usize>, cfg: &Cfg, columns: usize) -> usize {
+    let Some(term) = width else {
+        return usize::MAX;
+    };
+    let frame = 3 * columns + 1 + display_width(&cfg.prefix);
+    term.saturating_sub(frame)
+}
+
+/// 把各列的自然宽度压进 `budget`：挑当前最宽的列一格格削，直到放得下。
+///
+/// 每列至少留两格：一个汉字或 emoji 就占两格，再窄就一定会把内容挤到框线外面去。
+/// 连这个下限都放不下时保持原样——宁可整张表超出终端宽度（让它自己折行），
+/// 也不能把框线挤断。
+fn fit_widths(natural: &[usize], budget: usize) -> Vec<usize> {
+    let floor: Vec<usize> = natural.iter().map(|w| (*w).min(2)).collect();
+    if budget < floor.iter().sum::<usize>() {
+        return natural.to_vec();
+    }
+    let mut widths = natural.to_vec();
+    while widths.iter().sum::<usize>() > budget {
+        let widest = widths
+            .iter()
+            .zip(&floor)
+            .enumerate()
+            .filter(|(_, (w, low))| w > low)
+            .max_by_key(|(_, (w, _))| **w)
+            .map(|(i, _)| i);
+        match widest {
+            Some(i) => widths[i] -= 1,
+            None => break,
+        }
+    }
+    widths
+}
+
 /// 单元格内容按对齐方式补齐，两侧各留一格空格。
 /// 宽度用的是显示宽度，所以中文也能对齐。
 fn pad(text: &str, width: usize, align: Align) -> String {
@@ -938,6 +1001,11 @@ mod tests {
     /// 关掉颜色渲染成纯文本，方便直接比对排版。
     fn render(src: &str) -> String {
         Markdown::new(highlighter(), false, None, None).render(src)
+    }
+
+    /// 打开颜色渲染，用来断言转义序列。
+    fn render_color(src: &str) -> String {
+        Markdown::new(highlighter(), true, None, None).render(src)
     }
 
     #[test]
@@ -1056,6 +1124,116 @@ sequenceDiagram
         assert_eq!(lines[1], "│ 名字 │ 值 │");
         assert_eq!(lines[3], "│ 中文 │  1 │");
         assert_eq!(lines[4], "└──────┴────┘");
+    }
+
+    /// 多码点 emoji 按终端宽度算。逐字符相加时 VS16 变体少算一格、
+    /// 肤色修饰和 ZWJ 组合多算几格，表格就会错位。
+    /// 码点写成转义：连接符和变体选择符是不可见的，直接写字面量容易在编辑中丢掉。
+    #[test]
+    fn 表格里的多码点_emoji_不撑破对齐() {
+        for (cell, row) in [
+            ("\u{26a0}\u{fe0f}", "│ \u{26a0}\u{fe0f}   │"),
+            ("\u{1f44d}\u{1f3fd}", "│ \u{1f44d}\u{1f3fd}   │"),
+            (
+                "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+                "│ \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}   │",
+            ),
+            ("\u{1f1e8}\u{1f1f3}", "│ \u{1f1e8}\u{1f1f3}   │"),
+        ] {
+            let out = render(&format!("| 状态 |\n|---|\n| {cell} |\n"));
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines[0], "┌──────┐", "{cell} 的上边框");
+            assert_eq!(lines[1], "│ 状态 │", "{cell} 的表头");
+            assert_eq!(lines[3], row, "{cell} 的数据行");
+            assert_eq!(display_width(lines[3]), 8, "{cell} 的数据行宽度");
+            assert_eq!(lines[4], "└──────┘", "{cell} 的下边框");
+        }
+    }
+
+    /// 边框和列表标记的样式不能渗进正文：表格曾经整张都是边框灰，
+    /// 表头的粗体还会留在后面的竖线上。
+    #[test]
+    fn 边框样式不渗进正文() {
+        let out = render_color("| 名字 |\n|---|\n| 中文 |\n");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[1],
+            "\x1b[38;5;8m│\x1b[0m \x1b[1m名字\x1b[0m \x1b[38;5;8m│\x1b[0m"
+        );
+        assert_eq!(lines[3], "\x1b[38;5;8m│\x1b[0m 中文 \x1b[38;5;8m│\x1b[0m");
+        assert_eq!(
+            render_color("> 引用\n"),
+            "\x1b[38;5;8m│ \x1b[0m引用\x1b[0m\n"
+        );
+        assert_eq!(
+            render_color("- 纯文本\n"),
+            "\x1b[38;5;6m• \x1b[0m纯文本\n"
+        );
+    }
+
+    /// 表格比终端宽时按列压窄、折单元格内容，框线仍然对齐。
+    /// 列宽是挑最宽的列一格格削出来的：16 格的列让出 7 格正好放得下。
+    #[test]
+    fn 超宽表格按终端宽度折行() {
+        let src = "| 名字 | 说明 |\n|---|---|\n| 中文 | 一二三四五六七八 |\n";
+        let out = Markdown::new(highlighter(), false, None, None)
+            .with_width(Some(20))
+            .render(src);
+        assert_eq!(
+            out,
+            "┌──────┬───────────┐\n\
+             │ 名字 │ 说明      │\n\
+             ├──────┼───────────┤\n\
+             │ 中文 │ 一二三四  │\n\
+             │      │ 五六七八  │\n\
+             └──────┴───────────┘\n"
+        );
+        for line in out.lines() {
+            assert_eq!(display_width(line), 20, "{line:?}");
+        }
+    }
+
+    /// 放得下就不折：给了终端宽度，输出也必须和没给时一模一样。
+    #[test]
+    fn 表格放得下时不折行() {
+        let src = "| 名字 | 说明 |\n|---|---|\n| 中文 | 一两句话 |\n";
+        let wide = Markdown::new(highlighter(), false, None, None)
+            .with_width(Some(200))
+            .render(src);
+        assert_eq!(wide, render(src));
+    }
+
+    /// 折行后每行仍然是完整的样式：续行要把表头的粗体补回来。
+    #[test]
+    fn 折行后的续行保留样式() {
+        let src = "| 一个很长的表头 |\n|---|\n| 内容 |\n";
+        let out = Markdown::new(highlighter(), true, None, None)
+            .with_width(Some(12))
+            .render(src);
+        let lines: Vec<&str> = out.lines().collect();
+        // 表头折成两行，两行都带粗体，各自的竖线保持边框灰
+        assert!(lines[1].starts_with("\x1b[38;5;8m│\x1b[0m \x1b[1m"), "{:?}", lines[1]);
+        assert!(lines[2].contains("\x1b[1m"), "{:?}", lines[2]);
+        for line in &lines {
+            assert_eq!(display_width(line), 12, "{line:?}");
+        }
+    }
+
+    /// 列数太多、压不进终端宽度时保持自然宽度（让终端自己折），
+    /// 但框线内部必须仍然对齐——不能把内容挤到框线外面去。
+    #[test]
+    fn 压不进终端宽度时保持原样且仍然对齐() {
+        let src = "| 甲 | 乙 | 丙 |\n|---|---|---|\n| 一二 | 三四 | 五六 |\n";
+        let out = Markdown::new(highlighter(), false, None, None)
+            .with_width(Some(12))
+            .render(src);
+        let widths: Vec<usize> = out.lines().map(display_width).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "框线歪了：{widths:?}\n{out}"
+        );
+        // 12 格放不下，所以宽度是自然宽度而不是 12
+        assert_eq!(widths[0], render(src).lines().next().map(display_width).unwrap());
     }
 
     #[test]

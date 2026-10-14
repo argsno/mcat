@@ -432,6 +432,19 @@ fn preview(sequence: &str) -> String {
     format!("{head}…（共 {} 字节）", sequence.len())
 }
 
+/// 表格折行可用的终端宽度。
+///
+/// 只在终端里给：管道和重定向里既拿不到宽度，产物也不该被折行——
+/// 和图片「只在终端里画」是同一条规矩。行号会占掉左边几列，先扣掉。
+fn table_width(cli: &Cli) -> Option<usize> {
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    let (cols, _) = terminal_size::terminal_size()?;
+    let numbers = if cli.numbers { style::NUMBER_COLS } else { 0 };
+    Some((cols.0 as usize).saturating_sub(numbers))
+}
+
 /// 决定要不要画图片。stdout 不是终端就不画。
 fn setup_images(cli: &Cli, is_terminal: bool) -> Option<Images> {
     if !is_terminal {
@@ -526,6 +539,7 @@ fn emit(
                 renderer.as_ref(),
                 diagrams.map(|(renderer, sizing)| (renderer, *sizing)),
             )
+            .with_width(table_width(cli))
             .render(text);
             out.write_block(&rendered);
         }
