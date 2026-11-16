@@ -9,6 +9,7 @@ mod image;
 mod markdown;
 mod mermaid;
 mod style;
+mod terminal;
 
 use clap::Parser;
 use highlight::Highlighter;
@@ -77,8 +78,8 @@ struct Cli {
     #[arg(long, value_name = "N")]
     image_cols: Option<usize>,
 
-    /// mermaid 图的配色：light 或 dark。默认 light
-    #[arg(long, value_name = "THEME", default_value = "light")]
+    /// mermaid 图的配色：auto 跟随终端背景，或 light、dark。默认 auto
+    #[arg(long, value_name = "THEME", default_value = "auto")]
     mermaid_theme: String,
 
     /// 不输出内容，只报告图片功能的每一项决策，排查用
@@ -210,7 +211,7 @@ fn mermaid_theme(cli: &Cli) -> Theme {
         Some(theme) => theme,
         None => {
             eprintln!(
-                "mcat: 未知 mermaid 主题 {:?}，可选：light、dark",
+                "mcat: 未知 mermaid 主题 {:?}，可选：auto、light、dark",
                 cli.mermaid_theme
             );
             Theme::default()
@@ -365,13 +366,17 @@ fn check_images(cli: &Cli) -> ExitCode {
 
         // mermaid 图走同一条链路，只是字节来自渲染而不是读文件
         if !standalone {
-            let theme = mermaid_theme(cli);
+            let preference = mermaid_theme(cli);
             let sizing = images.sizing();
             let blocks = markdown::mermaid_sources(&source);
+            let renderer = mermaid::Renderer::new(preference);
             if !blocks.is_empty() {
-                println!("\nmermaid 主题  {}", theme.name());
+                let source = match preference {
+                    Theme::Auto => "跟随终端背景",
+                    _ => "--mermaid-theme 指定",
+                };
+                println!("\nmermaid 主题  {}（{source}）", renderer.theme().name());
             }
-            let renderer = mermaid::Renderer::new(theme);
             for block in blocks {
                 total += 1;
                 let first = block.lines().next().unwrap_or_default();

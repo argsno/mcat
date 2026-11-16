@@ -11,6 +11,9 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # mermaid 图：解析、布局、光栅化成 PNG。纯 Rust，无 C 依赖。
 # 只开 render + raster，不开 ascii —— 框线字符渲染的效果不足以进终端正文。
 merman = { version = "0.7.0", features = ["render", "raster"] }
+# 终端 termios：查背景色前把控制终端切到原始模式。terminal_size 已经
+# 带进这份依赖，这里只是直接用它，不新增编译单元。
+rustix = { version = "1.1.5", features = ["termios"] }
 pulldown-cmark = "0.13.4"
 sha2 = "0.11.0"
 # 纯 Rust 的 regex 后端，避免 onig(C) 依赖
