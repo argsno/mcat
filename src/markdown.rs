@@ -750,8 +750,13 @@ impl<'a, 'i> Markdown<'a, 'i> {
             self.row(p, cfg, &head_cells, &head_align, &widths);
             self.border(p, cfg, "├", "┼", "┤", &widths);
         }
-        for (cells, aligns) in &body {
+        for (i, (cells, aligns)) in body.iter().enumerate() {
             self.row(p, cfg, &wrap(cells), aligns, &widths);
+            // 行间横线按逻辑行画：折行的单元格同属一行，续行之间不插线。
+            // 最后一行不画，底线已经收口。
+            if i + 1 < body.len() {
+                self.border(p, cfg, "├", "┼", "┤", &widths);
+            }
         }
         self.border(p, cfg, "└", "┴", "┘", &widths);
     }
@@ -1124,6 +1129,43 @@ sequenceDiagram
         assert_eq!(lines[1], "│ 名字 │ 值 │");
         assert_eq!(lines[3], "│ 中文 │  1 │");
         assert_eq!(lines[4], "└──────┴────┘");
+    }
+
+    /// 每个逻辑行结束后画一条横线，最后一行交给底线收口。
+    #[test]
+    fn 表格行之间画分隔线() {
+        let out = render("| 名字 | 值 |\n|---|---:|\n| 甲 | 1 |\n| 乙 | 22 |\n");
+        assert_eq!(
+            out,
+            "┌──────┬────┐\n\
+             │ 名字 │ 值 │\n\
+             ├──────┼────┤\n\
+             │ 甲   │  1 │\n\
+             ├──────┼────┤\n\
+             │ 乙   │ 22 │\n\
+             └──────┴────┘\n"
+        );
+    }
+
+    /// 单元格折成的续行属于同一个逻辑行，续行之间不插横线；
+    /// 横线只画在两个逻辑行之间。
+    #[test]
+    fn 折行的续行之间不画分隔线() {
+        let src = "| 名字 | 说明 |\n|---|---|\n| 甲 | 一二三四五六七八 |\n| 乙 | 九十 |\n";
+        let out = Markdown::new(highlighter(), false, None, None)
+            .with_width(Some(20))
+            .render(src);
+        assert_eq!(
+            out,
+            "┌──────┬───────────┐\n\
+             │ 名字 │ 说明      │\n\
+             ├──────┼───────────┤\n\
+             │ 甲   │ 一二三四  │\n\
+             │      │ 五六七八  │\n\
+             ├──────┼───────────┤\n\
+             │ 乙   │ 九十      │\n\
+             └──────┴───────────┘\n"
+        );
     }
 
     /// 多码点 emoji 按终端宽度算。逐字符相加时 VS16 变体少算一格、
