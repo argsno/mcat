@@ -8,16 +8,20 @@
 //! （框线字符画），效果不足以进终端正文，没开。
 
 use crate::image::{Sizing, dimensions};
+use crate::terminal;
 use merman::render::raster::{RasterOptions, RasterSizeLimit};
-use merman::render::{HeadlessRenderer, HostThemeProfile};
+use merman::render::{HeadlessRenderer, HostThemeProfile, HostThemeRootBackground};
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-/// 图的明暗配色。跟终端背景一致才看得清，默认亮色（和 mermaid 官网一致）。
+/// 图的明暗配色。跟终端背景一致才看得清。
+///
+/// `Auto` 在真正要画图时才去问终端，没图的文档不付这个代价。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Theme {
     #[default]
+    Auto,
     Light,
     Dark,
 }
@@ -26,6 +30,7 @@ impl Theme {
     /// 解析 `--mermaid-theme` 的取值。
     pub fn parse(name: &str) -> Option<Theme> {
         match name.to_ascii_lowercase().as_str() {
+            "auto" => Some(Theme::Auto),
             "light" => Some(Theme::Light),
             "dark" => Some(Theme::Dark),
             _ => None,
@@ -34,8 +39,20 @@ impl Theme {
 
     pub fn name(self) -> &'static str {
         match self {
+            Theme::Auto => "auto",
             Theme::Light => "light",
             Theme::Dark => "dark",
+        }
+    }
+
+    /// 把 `Auto` 落成具体主题。认不出终端背景时按亮色，和 mermaid 官网一致。
+    pub fn resolve(self) -> Theme {
+        match self {
+            Theme::Auto => match terminal::is_dark() {
+                Some(true) => Theme::Dark,
+                _ => Theme::Light,
+            },
+            other => other,
         }
     }
 }
@@ -64,7 +81,12 @@ pub struct Prepared {
 /// 拿不到字节时返回 `None`（识别不出图类型、语法错、系统没装字体等等），
 /// 调用方据此退回显示源码——mcat 在图片链路上任何一环走不通都是这个策略。
 pub struct Renderer {
-    inner: HeadlessRenderer,
+    /// 用户选的主题，可能还是 `Auto`。
+    preference: Theme,
+    /// 解析后的主题，第一次画图时算出来。
+    resolved: Cell<Option<Theme>>,
+    /// 按主题建好的渲染器，也用同样的懒办法。
+    inner: RefCell<Option<HeadlessRenderer>>,
     /// 同一段源码只渲染一次。一份文档里同一张图出现多次很常见。
     /// 失败也记下来：同一段源码重试一百次也是同样的失败，重复解析纯属浪费。
     cache: RefCell<HashMap<String, Result<Prepared, String>>>,
@@ -72,14 +94,41 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(theme: Theme) -> Self {
-        let profile = match theme {
-            Theme::Light => HostThemeProfile::editor_light(),
-            Theme::Dark => HostThemeProfile::editor_dark(),
-        };
         Renderer {
-            inner: HeadlessRenderer::new().with_compiled_host_theme(&profile.compile()),
+            preference: theme,
+            resolved: Cell::new(None),
+            inner: RefCell::new(None),
             cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// 实际使用的主题。`Auto` 在这里才去问终端。
+    pub fn theme(&self) -> Theme {
+        if let Some(resolved) = self.resolved.get() {
+            return resolved;
+        }
+        let resolved = self.preference.resolve();
+        self.resolved.set(Some(resolved));
+        resolved
+    }
+
+    fn engine(&self) -> std::cell::RefMut<'_, Option<HeadlessRenderer>> {
+        let theme = self.theme();
+        let mut slot = self.inner.borrow_mut();
+        slot.get_or_insert_with(|| {
+            let mut profile = match theme {
+                Theme::Dark => HostThemeProfile::editor_dark(),
+                _ => HostThemeProfile::editor_light(),
+            };
+            // 底色留给终端：不透明白底会在深色终端上变成一块刺眼的方块。
+            // 图里的节点和连线已经自带颜色，不需要再画背景。
+            // 注意 `None` 只是“不覆盖”，mermaid 自带的白色还留着，
+            // 必须显式写成 transparent。
+            profile.output.root_background =
+                HostThemeRootBackground::Color("transparent".to_string());
+            HeadlessRenderer::new().with_compiled_host_theme(&profile.compile())
+        });
+        slot
     }
 
     pub fn png(&self, source: &str, sizing: &Sizing) -> Option<Vec<u8>> {
@@ -105,10 +154,13 @@ impl Renderer {
 
     /// 渲染的每一步。`Err` 里是给用户看的原因。
     fn render(&self, source: &str, sizing: &Sizing) -> Result<Prepared, String> {
-        // resvg 不认 <foreignObject> 里的标签，要先换成 <text> 才能光栅化出文字
+        // resvg 不认 <foreignObject> 里的标签，要先换成 <text> 才能光栅化出文字。
+        // 走编译好的 host theme 管线（resvg-safe），背景设成透明。
         let Some(svg) = self
-            .inner
-            .render_svg_resvg_safe_sync(source)
+            .engine()
+            .as_ref()
+            .expect("engine 刚建好")
+            .render_svg_sync(source)
             .map_err(|e| e.to_string())?
         else {
             return Err("没识别出图表类型".to_string());
@@ -330,10 +382,38 @@ mod tests {
 
     #[test]
     fn 主题解析() {
+        assert_eq!(Theme::parse("auto"), Some(Theme::Auto));
         assert_eq!(Theme::parse("light"), Some(Theme::Light));
         assert_eq!(Theme::parse("DARK"), Some(Theme::Dark));
         assert_eq!(Theme::parse("neon"), None);
-        assert_eq!(Theme::default(), Theme::Light);
+        assert_eq!(Theme::default(), Theme::Auto);
+        // 显式指定的主题不需要问终端
+        assert_eq!(Theme::Light.resolve(), Theme::Light);
+        assert_eq!(Theme::Dark.resolve(), Theme::Dark);
+    }
+
+    /// 图要能贴在任意终端背景上，所以不能画不透明白底。
+    /// 以前 SVG 根节点带着 mermaid 的 `background-color:white`，
+    /// 深色终端里就是一块白方块。
+    #[test]
+    fn 两种主题都不带不透明底色() {
+        let s = sizing();
+        let source = "flowchart TD\n  A[开始] --> B[结束]\n";
+        for theme in [Theme::Light, Theme::Dark] {
+            let prepared = Renderer::new(theme).prepare(source, &s).unwrap();
+            let image = image::load_from_memory(&prepared.png)
+                .expect("出图应该是能解码的 PNG")
+                .to_rgba8();
+            let (w, h) = image.dimensions();
+            for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+                assert_eq!(
+                    image.get_pixel(x, y)[3],
+                    0,
+                    "{} 主题的角落 ({x},{y}) 不透明",
+                    theme.name()
+                );
+            }
+        }
     }
 
     /// 暗色主题要真的换掉配色，否则 `--mermaid-theme dark` 是空开关。

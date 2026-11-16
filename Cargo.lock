@@ -1363,6 +1363,7 @@ dependencies = [
  "image",
  "merman",
  "pulldown-cmark 0.13.4",
+ "rustix",
  "sha2",
  "syntect",
  "terminal_size",
