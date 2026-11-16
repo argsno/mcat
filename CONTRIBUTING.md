@@ -29,6 +29,7 @@ $ mcat examples/demo.md
 | `src/highlight.rs` | syntect 封装：按语言逐行上色 |
 | `src/image.rs` | 图片协议、下载缓存、降采样转码 |
 | `src/mermaid.rs` | mermaid 源码 → SVG → PNG |
+| `src/terminal.rs` | 查终端背景色，决定图的明暗主题 |
 | `src/style.rs` | 样式、显示宽度计算、带状态的输出器 |
 
 `src/style.rs` 里的 `Painter` 只在样式变化时写转义序列，并在每行结束时复位，
@@ -58,6 +59,9 @@ $ mcat examples/demo.md
 这种错位在测试里很难自己冒出来——mcat 补的白和它自己算的宽度永远自洽，内部一致性能对上，
 只有按「终端会画几格」写断言才抓得住。折行同理：`wrap_styled` 不会从续接字符（ZWJ、肤色、
 组合音）前面断开，宁可让那一行超出一格。
+
+**行间横线按逻辑行画。** 单元格折成多行时，续行属于同一行，之间不插横线；
+`├┼┤` 只画在两个逻辑行之间，最后一行由底线收口。
 
 ## 图片链路的取舍
 
@@ -99,6 +103,11 @@ $ mcat examples/demo.md
   不该每次都重新解析。
 - **只用 `render` + `raster` 两个 feature。** 默认 feature 是空的，但 `ascii`、`pdf`、
   `eframe`（GUI）都在可选列表里，别顺手开。
+- **底色透明，明暗跟终端。** SVG 根节点默认带 mermaid 的 `background-color:white`，
+  深色终端里就是一块白方块。所以主题的 `root_background` 显式写成 `transparent`，
+  让终端背景透出来。明暗由 `src/terminal.rs` 用 OSC 11 查（直接开 `/dev/tty`，
+  stdout/stderr 被重定向也能查），查不到看 `COLORFGBG`，再不行按亮色。
+  查询是懒的：没有 mermaid 块的文档不会等这一下。
 - **CJK 靠系统字体。** 光栅化时 fontdb 扫系统字体，中文标签需要系统装了中文字体。
   没装的话标签画不出来，但流程和箭头还在。
 
@@ -132,12 +141,15 @@ $ sh examples/send-png.sh examples/gradient.png
 | `base64` | 图形协议载荷编码 |
 | `sha2` | 远程图片缓存键、mermaid 图 id |
 | `unicode-width` | 东亚宽度计算 |
+| `rustix` | 终端 termios（查背景色时切原始模式） |
 | `clap` | 命令行解析 |
 | `merman` | mermaid 图解析、布局、光栅化 |
 
-依赖从 4 个涨到 10 个（256 个传递依赖），冷构建从 6 秒涨到 74 秒。
+依赖从 4 个涨到 11 个（256 个传递依赖），冷构建从 6 秒涨到 74 秒。
 
-`image` 和 `ureq` 是图片功能带来的，`merman` 是 mermaid 图带来的。`merman` 会带进
+`image` 和 `ureq` 是图片功能带来的，`merman` 是 mermaid 图带来的，`rustix` 原本就在
+`terminal_size` 的依赖树里，这次只多开了 `termios` 这一个 feature，没有新增编译单元。
+`merman` 会带进
 resvg、tiny-skia、fontdb（找系统字体）和 lalrpop（构建期生成解析器）——它是传递依赖里
 最重的一个，也是冷构建时间翻倍的原因。
 
