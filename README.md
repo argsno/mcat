@@ -25,7 +25,7 @@
 | | 命令 | 说明 |
 |---|---|---|
 | **Markdown 渲染** | `mcat README.md` | 标题分级配色、列表、引用、表格、任务清单、脚注，按 CommonMark 渲染 |
-| **语法高亮** | `mcat src/main.rs` | 代码块和其他源码文件按语言上色，[syntect](https://github.com/trishume/syntect) 主题，纯 Rust 后端 |
+| **语法高亮** | `mcat src/main.rs` | 代码块和其他源码文件按语言上色，[bat](https://github.com/sharkdp/bat) 的语法集 + [syntect](https://github.com/trishume/syntect) 主题，纯 Rust 后端 |
 | **看图** | `mcat examples/gradient.png` | Kitty 图形协议 / iTerm2 内联图片，图片直接画在终端里；认文件内容，不认扩展名 |
 
 ```console
@@ -62,6 +62,8 @@ flowchart LR
   **表格例外**：比终端宽的表格会压窄列、把单元格内容折行，框线始终对齐；管道和重定向里不折。
 - **正文配色只用终端的 16 个基础色**，跟着你的调色板走；语法高亮来自 syntect 的真彩色主题，
   自动映射到 256 色。
+- **语言先按整个文件名认，再按扩展名**：`Dockerfile`、`Makefile`、`.gitignore` 这类没有扩展名的
+  文件也能上色；还认不出就看首行 shebang，`-l` 可以强制指定。
 - **表格按显示宽度对齐**（中文、全角和整簇 emoji 都算两列），表头加粗。
 - `-n` 数的是输出行。渲染会重排块，数字和源文件对不上——和 `cat -n` 的行为一致。
 - 不是合法 UTF-8 的文件原样输出，不做渲染。

@@ -20,6 +20,11 @@ sha2 = "0.11.0"
 syntect = { version = "5.3.0", default-features = false, features = [
     "default-fancy",
 ] }
+# bat 维护的语法集：syntect 自带的 75 种之外还有 TypeScript、TOML、Swift 等。
+# 必须用 fancy 变体，onig 变体和 syntect 的 regex-onig 一样会拉 C 依赖。
+two-face = { version = "0.5.2", default-features = false, features = [
+    "syntect-default-fancy",
+] }
 terminal_size = "0.4.4"
 unicode-width = "0.2.2"
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }

@@ -13,8 +13,8 @@ $ cargo test
 $ cargo clippy --all-targets
 ```
 
-`cargo test` 跑的是内联在各源文件末尾的 `#[cfg(test)] mod tests`（在 `style.rs`、`markdown.rs`、
-`image.rs` 里）。手工验证渲染效果用 `examples/demo.md`：
+`cargo test` 跑的是内联在各源文件末尾的 `#[cfg(test)] mod tests`。手工验证渲染效果用
+`examples/demo.md`：
 
 ```console
 $ mcat examples/demo.md
@@ -26,7 +26,7 @@ $ mcat examples/demo.md
 |---|---|
 | `src/main.rs` | 命令行、文件读取、按类型分发 |
 | `src/markdown.rs` | Markdown 解析成块/行内树，再渲染成 ANSI 文本 |
-| `src/highlight.rs` | syntect 封装：按语言逐行上色 |
+| `src/highlight.rs` | syntect 封装：语法集、别名、按语言逐行上色 |
 | `src/image.rs` | 图片协议、下载缓存、降采样转码 |
 | `src/mermaid.rs` | mermaid 源码 → SVG → PNG |
 | `src/terminal.rs` | 查终端背景色，决定图的明暗主题 |
@@ -62,6 +62,12 @@ $ mcat examples/demo.md
 
 **行间横线按逻辑行画。** 单元格折成多行时，续行属于同一行，之间不插横线；
 `├┼┤` 只画在两个逻辑行之间，最后一行由底线收口。
+
+**语言识别顺序固定：文件名 → 扩展名 → 首行 shebang。** 文件名要排第一是因为
+`Dockerfile`、`Makefile`、`.gitignore`、`Cargo.lock` 这些写法登记在语法的扩展名列表里，
+按扩展名查会被当成没有扩展名。别名表只收「换一份语法仍然正确」的写法，不猜语言；
+bat 的 fancy 语法集用不了 JavaScript (Babel) 和 PowerShell（fancy-regex 不支持子例程调用），
+所以 `jsx` 退到会解析 JSX 的 tsx 语法，PowerShell 没有替代，保持不上色。
 
 ## 图片链路的取舍
 
@@ -135,6 +141,7 @@ $ sh examples/send-png.sh examples/gradient.png
 |---|---|
 | `pulldown-cmark` | CommonMark 解析 |
 | `syntect` | 语法高亮（fancy-regex 后端，无 C 依赖） |
+| `two-face` | 语法定义集（bat 的语法集，fancy 变体，无 C 依赖） |
 | `image` | 非 PNG 格式转码 + 降采样 |
 | `ureq` | 下载远程图片（rustls，无 C 依赖） |
 | `terminal_size` | 终端宽度 |
@@ -145,7 +152,7 @@ $ sh examples/send-png.sh examples/gradient.png
 | `clap` | 命令行解析 |
 | `merman` | mermaid 图解析、布局、光栅化 |
 
-依赖从 4 个涨到 11 个（256 个传递依赖），冷构建从 6 秒涨到 74 秒。
+依赖从 4 个涨到 12 个（257 个传递依赖），冷构建从 6 秒涨到 77 秒。
 
 `image` 和 `ureq` 是图片功能带来的，`merman` 是 mermaid 图带来的，`rustix` 原本就在
 `terminal_size` 的依赖树里，这次只多开了 `termios` 这一个 feature，没有新增编译单元。
@@ -157,6 +164,9 @@ resvg、tiny-skia、fontdb（找系统字体）和 lalrpop（构建期生成解�
 `syntect` 特意选了 fancy-regex 而不是默认的 onig，`ureq` 特意关了 default-features 只留 rustls，
 `merman` 没有 C 依赖但会让构建慢一个数量级，所以只开了它需要的 `render` + `raster`
 两个 feature（`ascii` 那套框线字符渲染器用不上）。
+
+`two-face` 只多一个编译单元，但必须和 `syntect` 用同一套 fancy 变体；它的
+`default-features` 会开 onig 变体，那会拉回 C 依赖，所以同样关了默认特性。
 
 「无 C 依赖」这条仍然成立：`core-foundation-sys`（merman 经 chrono 带进来的）只有 extern 声明，
 没有 build.rs，不编译 C 代码；唯一拉 `cc` 的是 `ring`，而它本来就在 `ureq` 的链路上。

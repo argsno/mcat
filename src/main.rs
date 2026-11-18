@@ -574,7 +574,8 @@ enum Mode<'a> {
 }
 
 fn resolve<'a>(cli: &Cli, hl: &'a Highlighter, path: Option<&Path>, first_line: &str) -> Mode<'a> {
-    if cli.no_render || cli.no_images {
+    // 只有 --no-render 是「什么都别渲染」；--no-images 只关掉图片
+    if cli.no_render {
         return Mode::Raw;
     }
 
@@ -606,8 +607,16 @@ fn resolve<'a>(cli: &Cli, hl: &'a Highlighter, path: Option<&Path>, first_line: 
         return Mode::Markdown;
     }
 
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+
+    // 先按整个文件名查，再按扩展名：Dockerfile、Makefile、.gitignore
+    // 这类文件名就登记在语法的扩展名列表里。
     let syntax = hl
-        .by_extension(&ext)
+        .by_file_name(file_name)
+        .or_else(|| hl.by_extension(&ext))
         // 扩展名不认识时看第一行，像不像某种语言
         .or_else(|| hl.by_first_line(first_line));
 
@@ -615,5 +624,67 @@ fn resolve<'a>(cli: &Cli, hl: &'a Highlighter, path: Option<&Path>, first_line: 
     match syntax {
         Some(syntax) if !hl.is_plain(syntax) => Mode::Syntax(syntax),
         _ => Mode::Raw,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn highlighter() -> Highlighter {
+        Highlighter::new("base16-ocean.dark").unwrap()
+    }
+
+    #[test]
+    fn 不给_language_时按文件名和扩展名认() {
+        let hl = highlighter();
+        let cli = Cli::parse_from(["mcat"]);
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("Dockerfile")), "FROM alpine"),
+            Mode::Syntax(s) if s.name == "Dockerfile"
+        ));
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("a.ts")), "const x = 1"),
+            Mode::Syntax(s) if s.name == "TypeScript"
+        ));
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("README.md")), "# hi"),
+            Mode::Markdown
+        ));
+    }
+
+    #[test]
+    fn language_参数也走别名() {
+        let hl = highlighter();
+        let cli = Cli::parse_from(["mcat", "-l", "jsx"]);
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("a.txt")), ""),
+            Mode::Syntax(s) if s.name == "TypeScriptReact"
+        ));
+    }
+
+    /// --no-images 只关图片，不该把源码和 Markdown 一起退化成 cat。
+    #[test]
+    fn no_images_不关文字渲染() {
+        let hl = highlighter();
+        let cli = Cli::parse_from(["mcat", "--no-images"]);
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("a.rs")), "fn main() {}"),
+            Mode::Syntax(s) if s.name == "Rust"
+        ));
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("a.md")), "# hi"),
+            Mode::Markdown
+        ));
+    }
+
+    #[test]
+    fn no_render_原样输出() {
+        let hl = highlighter();
+        let cli = Cli::parse_from(["mcat", "--no-render"]);
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("a.rs")), "fn main() {}"),
+            Mode::Raw
+        ));
     }
 }
