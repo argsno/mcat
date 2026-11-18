@@ -54,6 +54,43 @@ flowchart LR
 不会在深色终端里变成一块白方块。画不出来（协议不支持、源码有语法错、图类型 merman
 不支持）就退回显示源码，不报错。
 
+## 配置文件
+
+默认值可以写进 TOML 配置文件，命令行里显式给出的参数永远优先：
+
+```toml
+# ~/.config/mcat/config.toml
+theme = "base16-mocha.dark"
+mermaid_theme = "dark"
+image_rows = 16
+numbers = true
+no_color = false
+```
+
+| 键 | 对应参数 |
+|---|---|
+| `theme` | `--theme` |
+| `mermaid_theme` | `--mermaid-theme` |
+| `image_protocol` | `--image-protocol` |
+| `image_rows` | `--image-rows` |
+| `image_cols` | `--image-cols` |
+| `numbers` | `--numbers` |
+| `no_color` | `--no-color` |
+| `no_images` | `--no-images` |
+
+键名写成连字符（`image-rows`）也认。布尔项写 `true` 或 `false`；配置里打开的开关，
+命令行可以用反义参数关掉：`--no-numbers`、`--color`、`--images`。
+
+配置文件按这个顺序找，找到第一个就用：
+
+1. `--config <FILE>`
+2. `$MCAT_CONFIG`
+3. `$XDG_CONFIG_HOME/mcat/config.toml`（没设 `XDG_CONFIG_HOME` 时是 `~/.config/mcat/config.toml`）
+
+前两个是显式指定的，文件不存在会报错；默认路径不存在就静默跳过。
+这次调用要做什么（文件列表、`--language`、`--no-render`、`--list-themes`、`--check-images`）
+不能写进配置。完整的示例见 [examples/config.toml](examples/config.toml)。
+
 ## 输出长什么样
 
 - **始终带颜色**，重定向到文件也是——产物是给人看的。要纯文本用 `--no-render`（完全等同 `cat`），

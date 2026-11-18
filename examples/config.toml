@@ -1,0 +1,26 @@
+# mcat 配置文件示例。放到 ~/.config/mcat/config.toml 就会生效。
+# 命令行里显式给出的参数优先于这里。
+
+# 代码高亮主题，可用名字用 `mcat --list-themes` 查
+theme = "base16-mocha.dark"
+
+# mermaid 图配色：auto 跟随终端背景，或 light、dark
+mermaid_theme = "auto"
+
+# 图片协议：auto 按终端环境猜，或 kitty、iterm2
+image_protocol = "auto"
+
+# 嵌在 Markdown 里的图片和 mermaid 图最多占多少行
+image_rows = 20
+
+# 图片最多占多少列，注释掉时按终端宽度
+# image_cols = 100
+
+# 给每一行加行号
+numbers = false
+
+# 不输出颜色
+no_color = false
+
+# 不显示图片，只输出文字占位
+no_images = false
