@@ -26,10 +26,10 @@ $ mcat examples/demo.md
 |---|---|
 | `src/main.rs` | 命令行、文件读取、按类型分发 |
 | `src/markdown.rs` | Markdown 解析成块/行内树，再渲染成 ANSI 文本 |
-| `src/highlight.rs` | syntect 封装：语法集、别名、按语言逐行上色 |
+| `src/highlight.rs` | syntect 封装：语法集、别名、内置主题、按语言逐行上色 |
 | `src/image.rs` | 图片协议、下载缓存、降采样转码 |
 | `src/mermaid.rs` | mermaid 源码 → SVG → PNG |
-| `src/terminal.rs` | 查终端背景色，决定图的明暗主题 |
+| `src/terminal.rs` | 查终端背景色，决定图和代码主题的明暗 |
 | `src/config.rs` | 配置文件路径、TOML 解析、翻译成命令行默认值 |
 | `src/style.rs` | 样式、显示宽度计算、带状态的输出器 |
 
@@ -63,6 +63,18 @@ $ mcat examples/demo.md
 
 **行间横线按逻辑行画。** 单元格折成多行时，续行属于同一行，之间不插横线；
 `├┼┤` 只画在两个逻辑行之间，最后一行由底线收口。
+
+**语法高亮写真彩色，不再量化到 256 色。** 量化误差会把 `base16-ocean.dark` 的函数蓝
+`#8fa1b3` 压成灰 247 `#9e9e9e`，函数名和正文分不开。`Style::Color` 区分 `Ansi(u8)` 和
+`Rgb(u8, u8, u8)`：正文继续用 ANSI 0–15，跟随用户调色板；语法高亮用 RGB，SGR 写 `38;2`。
+
+**`auto` 主题懒查询。** `--theme auto` 默认按终端背景选 `mcat-dark` / `mcat-light`；
+查询在第一次真正高亮代码时才发生（`Highlighter::theme` 的 `OnceLock`），没有代码块的文档
+不会为 OSC 11 等待。探测不到背景时按浅色走，和 mermaid 的默认一致。
+
+**代码块色条是背景色空格，不是字符。** Markdown 代码块每行前面写一格带背景色的空格，
+再写一格普通空格；复制出去只有两个前导空格，和原来的缩进一样。单独看源码文件不加色条，
+保持顶格，复制源码不会多出空格。
 
 **语言识别顺序固定：文件名 → 扩展名 → 首行 shebang。** 文件名要排第一是因为
 `Dockerfile`、`Makefile`、`.gitignore`、`Cargo.lock` 这些写法登记在语法的扩展名列表里，
