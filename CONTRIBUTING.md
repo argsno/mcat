@@ -152,7 +152,7 @@ $ sh examples/send-png.sh examples/gradient.png
 | `clap` | 命令行解析 |
 | `merman` | mermaid 图解析、布局、光栅化 |
 
-依赖从 4 个涨到 12 个（257 个传递依赖），冷构建从 6 秒涨到 77 秒。
+依赖从 4 个涨到 12 个（248 个传递依赖），冷构建从 6 秒涨到 75 秒。
 
 `image` 和 `ureq` 是图片功能带来的，`merman` 是 mermaid 图带来的，`rustix` 原本就在
 `terminal_size` 的依赖树里，这次只多开了 `termios` 这一个 feature，没有新增编译单元。
@@ -164,6 +164,10 @@ resvg、tiny-skia、fontdb（找系统字体）和 lalrpop（构建期生成解�
 `syntect` 特意选了 fancy-regex 而不是默认的 onig，`ureq` 特意关了 default-features 只留 rustls，
 `merman` 没有 C 依赖但会让构建慢一个数量级，所以只开了它需要的 `render` + `raster`
 两个 feature（`ascii` 那套框线字符渲染器用不上）。
+
+`syntect` 只开 `default-themes`、`parsing`、`regex-fancy` 三个 feature：
+`default-fancy` 还会带进 html、plist-load、yaml-load 和默认语法集，这些 mcat 都用不到，
+`plist`、`yaml-rust` 也就跟着整棵依赖树一起消失了。
 
 `two-face` 只多一个编译单元，但必须和 `syntect` 用同一套 fancy 变体；它的
 `default-features` 会开 onig 变体，那会拉回 C 依赖，所以同样关了默认特性。
