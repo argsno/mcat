@@ -16,9 +16,17 @@ merman = { version = "0.7.0", features = ["render", "raster"] }
 rustix = { version = "1.1.5", features = ["termios"] }
 pulldown-cmark = "0.13.4"
 sha2 = "0.11.0"
-# 纯 Rust 的 regex 后端，避免 onig(C) 依赖
+# 纯 Rust 的 regex 后端，避免 onig(C) 依赖。只开用得到的部分：
+# default-fancy 还会带进 html、plist-load、yaml-load 和默认语法集，mcat 都用不到。
 syntect = { version = "5.3.0", default-features = false, features = [
-    "default-fancy",
+    "default-themes",
+    "parsing",
+    "regex-fancy",
+] }
+# bat 维护的语法集：syntect 自带的 75 种之外还有 TypeScript、TOML、Swift 等。
+# 必须用 fancy 变体，onig 变体和 syntect 的 regex-onig 一样会拉 C 依赖。
+two-face = { version = "0.5.2", default-features = false, features = [
+    "syntect-fancy",
 ] }
 terminal_size = "0.4.4"
 unicode-width = "0.2.2"
