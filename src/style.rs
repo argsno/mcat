@@ -3,9 +3,7 @@
 //! 输出器只在样式真正变化时写入转义序列，并且在换行时复位，
 //! 这样管道出去的文本不会积累无用的转义码。
 
-use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::OnceLock;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// 行号列宽：数字右对齐占用 5 列，后面跟一个 ` │ ` 分隔。
@@ -14,14 +12,30 @@ const NUMBER_WIDTH: usize = 6;
 pub const NUMBER_COLS: usize = NUMBER_WIDTH + 3;
 const RESET: &str = "\x1b[0m";
 
-/// 256 色调色板索引。
+/// 一个终端颜色：调色板索引或 24 位真彩色。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Color(pub u8);
+pub enum Color {
+    /// 终端调色板索引，0–255。正文只用 0–15，跟随用户的主题。
+    Ansi(u8),
+    /// syntect 主题里的真彩色。
+    Rgb(u8, u8, u8),
+}
 
-/// 一组 SGR 属性。`fg` 为 `None` 时沿用终端的默认前景色。
+impl Color {
+    /// 生成前景（38）或背景（48）的 SGR 参数。
+    fn sgr(self, base: u8) -> String {
+        match self {
+            Color::Ansi(n) => format!("{base};5;{n}"),
+            Color::Rgb(r, g, b) => format!("{base};2;{r};{g};{b}"),
+        }
+    }
+}
+
+/// 一组 SGR 属性。`fg` / `bg` 为 `None` 时沿用终端自己的颜色。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Style {
     pub fg: Option<Color>,
+    pub bg: Option<Color>,
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
@@ -32,6 +46,7 @@ pub struct Style {
 impl Style {
     pub const PLAIN: Style = Style {
         fg: None,
+        bg: None,
         bold: false,
         dim: false,
         italic: false,
@@ -44,6 +59,10 @@ impl Style {
     }
     pub const fn fg(mut self, c: Color) -> Self {
         self.fg = Some(c);
+        self
+    }
+    pub const fn bg(mut self, c: Color) -> Self {
+        self.bg = Some(c);
         self
     }
     pub const fn bold(mut self) -> Self {
@@ -74,6 +93,7 @@ impl Style {
     pub fn merge(self, inner: Style) -> Style {
         Style {
             fg: inner.fg.or(self.fg),
+            bg: inner.bg.or(self.bg),
             bold: self.bold || inner.bold,
             dim: self.dim || inner.dim,
             italic: self.italic || inner.italic,
@@ -99,9 +119,17 @@ impl Style {
                 3 => style.italic = true,
                 4 => style.underline = true,
                 9 => style.strike = true,
-                38 if nums.get(i + 1) == Some(&5) => {
-                    style.fg = nums.get(i + 2).map(|n| Color(*n as u8));
-                    i += 2;
+                38 => {
+                    if let Some((color, skip)) = parse_color(&nums, i) {
+                        style.fg = Some(color);
+                        i += skip;
+                    }
+                }
+                48 => {
+                    if let Some((color, skip)) = parse_color(&nums, i) {
+                        style.bg = Some(color);
+                        i += skip;
+                    }
                 }
                 _ => {}
             }
@@ -110,7 +138,7 @@ impl Style {
         style
     }
 
-    /// 生成 SGR 序列，例如 `"\x1b[1;38;5;12m"`。只对非纯样式调用。
+    /// 生成 SGR 序列，例如 `"\x1b[1;38;2;154;172;190m"`。只对非纯样式调用。
     fn sgr(self) -> String {
         let mut s = String::from("\x1b[");
         let mut first = true;
@@ -137,10 +165,30 @@ impl Style {
             push("9");
         }
         if let Some(c) = self.fg {
-            push(&format!("38;5;{}", c.0));
+            push(&c.sgr(38));
+        }
+        if let Some(c) = self.bg {
+            push(&c.sgr(48));
         }
         s.push('m');
         s
+    }
+}
+
+/// 解析 `38;5;n`、`38;2;r;g;b` 以及对应的 48 背景写法。
+/// 返回颜色和额外消费的参数个数（不含 38/48 本身）。
+fn parse_color(nums: &[u16], at: usize) -> Option<(Color, usize)> {
+    match *nums.get(at + 1)? {
+        5 => Some((Color::Ansi(u8::try_from(*nums.get(at + 2)?).ok()?), 2)),
+        2 => Some((
+            Color::Rgb(
+                u8::try_from(*nums.get(at + 2)?).ok()?,
+                u8::try_from(*nums.get(at + 3)?).ok()?,
+                u8::try_from(*nums.get(at + 4)?).ok()?,
+            ),
+            4,
+        )),
+        _ => None,
     }
 }
 
@@ -402,7 +450,7 @@ impl<W: Write> Painter<W> {
         if !self.numbers || !self.at_start {
             return;
         }
-        self.apply(Style::new().dim().fg(Color(8)));
+        self.apply(Style::new().dim().fg(Color::Ansi(8)));
         let no = format!("{:>1$}", self.next_no, NUMBER_WIDTH);
         self.raw(&no);
         self.raw(" │ ");
@@ -578,86 +626,6 @@ impl Painter<TextBuf> {
     }
 }
 
-/// RGB → 256 色索引。在 256 色调色板里找最接近的颜色。
-///
-/// syntect 的主题用真彩色定义，直接输出在不支持真彩色的终端上会退化，
-/// 统一映射到 256 色可以让所有终端表现一致。
-pub fn to_256(r: u8, g: u8, b: u8) -> Color {
-    thread_local! {
-        static CACHE: std::cell::RefCell<HashMap<(u8, u8, u8), u8>> =
-            std::cell::RefCell::new(HashMap::new());
-    }
-    let idx = CACHE.with(|cache| {
-        *cache
-            .borrow_mut()
-            .entry((r, g, b))
-            .or_insert_with(|| nearest(r, g, b))
-    });
-    Color(idx)
-}
-
-/// xterm 的 16 个系统色。终端通常会重新映射这些值。
-const SYSTEM: [(u8, u8, u8); 16] = [
-    (0, 0, 0),
-    (128, 0, 0),
-    (0, 128, 0),
-    (128, 128, 0),
-    (0, 0, 128),
-    (128, 0, 128),
-    (0, 128, 128),
-    (192, 192, 192),
-    (128, 128, 128),
-    (255, 0, 0),
-    (0, 255, 0),
-    (255, 255, 0),
-    (0, 0, 255),
-    (255, 0, 255),
-    (0, 255, 255),
-    (255, 255, 255),
-];
-
-/// 6×6×6 立方体和 24 级灰阶。
-fn palette() -> &'static Vec<(u8, u8, u8)> {
-    static PALETTE: OnceLock<Vec<(u8, u8, u8)>> = OnceLock::new();
-    PALETTE.get_or_init(|| {
-        let mut p: Vec<(u8, u8, u8)> = SYSTEM.to_vec();
-        let levels = [0u8, 95, 135, 175, 215, 255];
-        for r in levels {
-            for g in levels {
-                for b in levels {
-                    p.push((r, g, b));
-                }
-            }
-        }
-        for i in 0..24 {
-            let v = (8 + i * 10) as u8;
-            p.push((v, v, v));
-        }
-        p
-    })
-}
-
-fn nearest(r: u8, g: u8, b: u8) -> u8 {
-    let pal = palette();
-    let mut best = 0usize;
-    let mut best_d = i64::MAX;
-    for (i, (pr, pg, pb)) in pal.iter().enumerate() {
-        // 按人眼权重计算平方距离
-        let dr = r as i64 - *pr as i64;
-        let dg = g as i64 - *pg as i64;
-        let db = b as i64 - *pb as i64;
-        let d = 3 * dr * dr + 6 * dg * dg + db * db;
-        if d < best_d {
-            best_d = d;
-            best = i;
-            if d == 0 {
-                break;
-            }
-        }
-    }
-    best as u8
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,10 +653,7 @@ mod tests {
             ["\x1b[38;5;3mab\x1b[0m", "\x1b[38;5;3mcd\x1b[0m"]
         );
         // 切点之后才开始的样式不往前面带
-        assert_eq!(
-            wrap_styled("ab\x1b[1mcd", 2),
-            ["ab", "\x1b[1mcd\x1b[0m"]
-        );
+        assert_eq!(wrap_styled("ab\x1b[1mcd", 2), ["ab", "\x1b[1mcd\x1b[0m"]);
     }
 
     /// 折行也不能把 emoji 组合拆到两行：一个组合整体占两格。
@@ -697,7 +662,10 @@ mod tests {
         let thumb = "\u{1f44d}\u{1f3fd}";
         assert_eq!(wrap_styled(&format!("{thumb}{thumb}"), 2), [thumb, thumb]);
         let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
-        assert_eq!(wrap_styled(&format!("{family}{family}"), 2), [family, family]);
+        assert_eq!(
+            wrap_styled(&format!("{family}{family}"), 2),
+            [family, family]
+        );
         // 窄到只有一格时宁可超出一格，也不把组合拆开
         assert_eq!(wrap_styled(thumb, 1), [thumb]);
     }
@@ -707,16 +675,16 @@ mod tests {
     fn 片段自带的样式不会渗到外面() {
         // 片段不带样式：写之前要先复位，否则内容会跟着上一段（边框）的灰色走
         let mut p = Painter::new(TextBuf::new());
-        p.write(Style::new().fg(Color(8)), "│");
+        p.write(Style::new().fg(Color::Ansi(8)), "│");
         p.write_raw(" 中文 ");
-        p.write(Style::new().fg(Color(8)), "│");
+        p.write(Style::new().fg(Color::Ansi(8)), "│");
         assert_eq!(plain(p), "\x1b[38;5;8m│\x1b[0m 中文 \x1b[38;5;8m│");
 
         // 片段自带粗体、没以复位收尾：写完之后必须先复位再上新的样式
         let mut p = Painter::new(TextBuf::new());
-        p.write(Style::new().fg(Color(8)), "│");
+        p.write(Style::new().fg(Color::Ansi(8)), "│");
         p.write_raw(" \x1b[1m名字 ");
-        p.write(Style::new().fg(Color(8)), "│");
+        p.write(Style::new().fg(Color::Ansi(8)), "│");
         assert_eq!(
             plain(p),
             "\x1b[38;5;8m│\x1b[0m \x1b[1m名字 \x1b[0m\x1b[38;5;8m│"
@@ -773,15 +741,15 @@ mod tests {
     #[test]
     fn 关掉颜色时不写任何转义序列() {
         let mut p = Painter::new(TextBuf::new()).with_color(false);
-        p.write(Style::new().bold().fg(Color(1)), "红");
-        p.write(Style::new().fg(Color(2)), "绿");
+        p.write(Style::new().bold().fg(Color::Ansi(1)), "红");
+        p.write(Style::new().fg(Color::Ansi(2)), "绿");
         p.newline();
         assert_eq!(plain(p), "红绿\n");
     }
 
     #[test]
     fn 样式没变就不重复写转义序列() {
-        let style = Style::new().fg(Color(3));
+        let style = Style::new().fg(Color::Ansi(3));
         let mut p = Painter::new(TextBuf::new());
         p.write(style, "a");
         p.write(style, "b");
@@ -802,10 +770,10 @@ mod tests {
     #[test]
     fn 嵌套样式合并成并集() {
         let bold = Style::new().bold();
-        let link = Style::new().fg(Color(12)).underline();
+        let link = Style::new().fg(Color::Ansi(12)).underline();
         let merged = bold.merge(link);
         assert!(merged.bold && merged.underline);
-        assert_eq!(merged.fg, Some(Color(12)));
+        assert_eq!(merged.fg, Some(Color::Ansi(12)));
     }
 
     #[test]
@@ -848,15 +816,15 @@ mod tests {
     }
 
     #[test]
-    fn 调色板里的原色映射回自己() {
-        assert_eq!(to_256(0, 0, 0).0, 0);
-        assert_eq!(to_256(255, 255, 255).0, 15);
-        // 正好等于系统色的，映射回系统色（终端可以重新定义它们）
-        assert_eq!(to_256(0, 0, 255).0, 12);
-        assert_eq!(to_256(0, 255, 255).0, 14);
-        // 立方体和灰阶的原色
-        assert_eq!(to_256(95, 135, 175).0, 67);
-        assert_eq!(to_256(18, 18, 18).0, 233);
-        assert_eq!(to_256(238, 238, 238).0, 255);
+    fn 真彩色写进_sgr_也能解析回来() {
+        let style = Style::new()
+            .fg(Color::Rgb(0x9a, 0xac, 0xbe))
+            .bg(Color::Rgb(0x4f, 0x5b, 0x66));
+        assert_eq!(style.sgr(), "\x1b[38;2;154;172;190;48;2;79;91;102m");
+        assert_eq!(Style::PLAIN.apply_sgr(&style.sgr()), style);
+
+        let only_bg = Style::new().bg(Color::Ansi(8));
+        assert_eq!(only_bg.sgr(), "\x1b[48;5;8m");
+        assert_eq!(Style::PLAIN.apply_sgr(&only_bg.sgr()), only_bg);
     }
 }

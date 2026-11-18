@@ -1,16 +1,23 @@
 //! 终端背景探测：判断当前终端是深色还是浅色。
 //!
-//! mermaid 图的配色要和终端背景一致，否则深色终端上会出现一块白底。
-//! 先用 OSC 11 问终端要背景色，问不到再看 `COLORFGBG`，都没有就返回
-//! `None`，由调用方按亮色处理。
+//! mermaid 图的配色和代码高亮主题都要和终端背景一致，否则深色终端上
+//! 会出现一块白底，浅色终端上的代码会看不清。先用 OSC 11 问终端要背景色，
+//! 问不到再看 `COLORFGBG`，都没有就返回 `None`，由调用方按亮色处理。
 //!
-//! 查询只在真的需要画图时发生：一次运行只查一次，没有 mermaid 块的文档
-//! 不会为此等待。
+//! 查询只在真的需要时发生：一次运行只查一次，没有 mermaid 块、没有代码块
+//! 的文档不会为此等待。
 
 use std::io::{Read, Write};
+use std::sync::OnceLock;
 
 /// 终端背景是不是深色。探测不出来返回 `None`。
 pub fn is_dark() -> Option<bool> {
+    // 代码主题和 mermaid 图可能各问一次；终端背景在一次运行里不会变，缓存住。
+    static DARK: OnceLock<Option<bool>> = OnceLock::new();
+    *DARK.get_or_init(detect_dark)
+}
+
+fn detect_dark() -> Option<bool> {
     #[cfg(unix)]
     if let Some(rgb) = query_rgb() {
         return Some(luma(rgb) < 0.5);

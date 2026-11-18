@@ -3,7 +3,7 @@
 //! 解析用 pulldown-cmark 拿到事件流，先建成一棵简单的块/行内树，
 //! 再递归渲染成带 ANSI 样式的文本。代码块交给 syntect 上色。
 
-use crate::highlight::Highlighter;
+use crate::highlight::{Highlighter, write_code_prefix};
 use crate::image::{Renderer as ImageRenderer, Sizing};
 use crate::mermaid::Renderer as MermaidRenderer;
 use crate::style::{Color, Painter, Style, TextBuf, display_width, wrap_styled};
@@ -13,17 +13,17 @@ use pulldown_cmark::{
 use std::collections::HashMap;
 
 // 配色只用 ANSI 0-15 的主题色，这样用户改终端调色板时整体依然协调。
-const C_H1: Color = Color(14);
-const C_H2: Color = Color(12);
-const C_H3: Color = Color(13);
-const C_H4: Color = Color(10);
-const C_H5: Color = Color(11);
-const C_H6: Color = Color(15);
-const C_CODE_SPAN: Color = Color(3);
-const C_LINK: Color = Color(12);
-const C_MUTED: Color = Color(8);
-const C_BULLET: Color = Color(6);
-const C_TASK_DONE: Color = Color(10);
+const C_H1: Color = Color::Ansi(14);
+const C_H2: Color = Color::Ansi(12);
+const C_H3: Color = Color::Ansi(13);
+const C_H4: Color = Color::Ansi(10);
+const C_H5: Color = Color::Ansi(11);
+const C_H6: Color = Color::Ansi(15);
+const C_CODE_SPAN: Color = Color::Ansi(3);
+const C_LINK: Color = Color::Ansi(12);
+const C_MUTED: Color = Color::Ansi(8);
+const C_BULLET: Color = Color::Ansi(6);
+const C_TASK_DONE: Color = Color::Ansi(10);
 
 const S_H1: Style = Style::new().bold().fg(C_H1);
 const S_H2: Style = Style::new().bold().fg(C_H2);
@@ -39,8 +39,6 @@ const S_BORDER: Style = Style::new().fg(C_MUTED);
 const S_RULE: Style = Style::new().fg(C_MUTED);
 const S_IMAGE: Style = Style::new().dim();
 
-/// 代码块相对正文缩进两格。
-const CODE_INDENT: &str = "  ";
 /// 水平分隔线的宽度。
 const RULE_WIDTH: usize = 60;
 /// 认成 mermaid 图的代码块语言标记。
@@ -537,11 +535,12 @@ impl<'a, 'i> Markdown<'a, 'i> {
                     return;
                 }
                 // 认不出语言时保持原样，没必要把每个字符都涂成同一个颜色
+                let stripe = self.hl.stripe();
                 match lang.as_deref().and_then(|name| self.hl.by_name(name)) {
                     Some(syntax) => {
                         for line in self.hl.lines(&node.text, syntax) {
                             self.open(p, cfg);
-                            p.write_prefix(Style::new(), CODE_INDENT);
+                            write_code_prefix(p, stripe);
                             for (style, text) in line {
                                 p.write(style, &text);
                             }
@@ -551,7 +550,7 @@ impl<'a, 'i> Markdown<'a, 'i> {
                     None => {
                         for line in node.text.lines() {
                             self.open(p, cfg);
-                            p.write_prefix(Style::new(), CODE_INDENT);
+                            write_code_prefix(p, stripe);
                             p.write(Style::new(), line);
                             p.newline();
                         }
@@ -1066,6 +1065,18 @@ mod tests {
         assert_eq!(render("```\na\n\nb\n```\n"), "  a\n  \n  b\n");
     }
 
+    /// 色条是背景色空格，不是字符；代码内容从第二格开始。
+    #[test]
+    fn 代码块左边是背景色色条() {
+        let out = render_color("```rust\nfn main() {}\n```\n");
+        let line = out.lines().next().expect("应该有一行");
+        assert!(
+            line.starts_with("\x1b[48;2;79;91;102m \x1b[0m "),
+            "{line:?}"
+        );
+        assert!(line.contains("\x1b[38;2;"), "{line:?}");
+    }
+
     #[test]
     fn 任务列表打勾() {
         assert_eq!(render("- [x] 做完\n- [ ] 没做\n"), "• ☑ 做完\n• ☐ 没做\n");
@@ -1207,10 +1218,7 @@ sequenceDiagram
             render_color("> 引用\n"),
             "\x1b[38;5;8m│ \x1b[0m引用\x1b[0m\n"
         );
-        assert_eq!(
-            render_color("- 纯文本\n"),
-            "\x1b[38;5;6m• \x1b[0m纯文本\n"
-        );
+        assert_eq!(render_color("- 纯文本\n"), "\x1b[38;5;6m• \x1b[0m纯文本\n");
     }
 
     /// 表格比终端宽时按列压窄、折单元格内容，框线仍然对齐。
@@ -1254,7 +1262,11 @@ sequenceDiagram
             .render(src);
         let lines: Vec<&str> = out.lines().collect();
         // 表头折成两行，两行都带粗体，各自的竖线保持边框灰
-        assert!(lines[1].starts_with("\x1b[38;5;8m│\x1b[0m \x1b[1m"), "{:?}", lines[1]);
+        assert!(
+            lines[1].starts_with("\x1b[38;5;8m│\x1b[0m \x1b[1m"),
+            "{:?}",
+            lines[1]
+        );
         assert!(lines[2].contains("\x1b[1m"), "{:?}", lines[2]);
         for line in &lines {
             assert_eq!(display_width(line), 12, "{line:?}");
@@ -1275,7 +1287,10 @@ sequenceDiagram
             "框线歪了：{widths:?}\n{out}"
         );
         // 12 格放不下，所以宽度是自然宽度而不是 12
-        assert_eq!(widths[0], render(src).lines().next().map(display_width).unwrap());
+        assert_eq!(
+            widths[0],
+            render(src).lines().next().map(display_width).unwrap()
+        );
     }
 
     #[test]

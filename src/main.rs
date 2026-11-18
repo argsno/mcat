@@ -56,8 +56,8 @@ struct Cli {
     #[arg(short = 'l', long, value_name = "LANG")]
     language: Option<String>,
 
-    /// 代码高亮主题，深色终端请用 .dark 结尾的主题
-    #[arg(long, default_value = "base16-ocean.dark", value_name = "THEME")]
+    /// 代码高亮主题：auto 跟随终端背景，或 mcat-dark、mcat-light 等
+    #[arg(long, default_value = "auto", value_name = "THEME")]
     theme: String,
 
     /// 不渲染，原样输出（等同 cat）
@@ -827,7 +827,7 @@ mod tests {
     #[test]
     fn 配置文件和命令行同时没提时用内置默认值() {
         let cli = parse_with(&[], &Config::default()).unwrap();
-        assert_eq!(cli.theme, "base16-ocean.dark");
+        assert_eq!(cli.theme, "auto");
         assert_eq!(cli.mermaid_theme, "auto");
         assert_eq!(cli.image_protocol, "auto");
         assert!(!cli.numbers);

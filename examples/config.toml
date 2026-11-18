@@ -1,8 +1,9 @@
 # mcat 配置文件示例。放到 ~/.config/mcat/config.toml 就会生效。
 # 命令行里显式给出的参数优先于这里。
 
-# 代码高亮主题，可用名字用 `mcat --list-themes` 查
-theme = "base16-mocha.dark"
+# 代码高亮主题：auto 跟随终端明暗；也可以是 mcat-dark、mcat-light，
+# 或 `mcat --list-themes` 列出的任意主题
+theme = "auto"
 
 # mermaid 图配色：auto 跟随终端背景，或 light、dark
 mermaid_theme = "auto"
