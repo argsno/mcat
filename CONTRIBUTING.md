@@ -30,6 +30,7 @@ $ mcat examples/demo.md
 | `src/image.rs` | 图片协议、下载缓存、降采样转码 |
 | `src/mermaid.rs` | mermaid 源码 → SVG → PNG |
 | `src/terminal.rs` | 查终端背景色，决定图的明暗主题 |
+| `src/config.rs` | 配置文件路径、TOML 解析、翻译成命令行默认值 |
 | `src/style.rs` | 样式、显示宽度计算、带状态的输出器 |
 
 `src/style.rs` 里的 `Painter` 只在样式变化时写转义序列，并在每行结束时复位，
@@ -68,6 +69,13 @@ $ mcat examples/demo.md
 按扩展名查会被当成没有扩展名。别名表只收「换一份语法仍然正确」的写法，不猜语言；
 bat 的 fancy 语法集用不了 JavaScript (Babel) 和 PowerShell（fancy-regex 不支持子例程调用），
 所以 `jsx` 退到会解析 JSX 的 tsx 语法，PowerShell 没有替代，保持不上色。
+
+**配置文件是参数，不是第二套合并逻辑。** `src/config.rs` 把 TOML 配置项翻译成命令行参数，
+插在真实参数前面再让 clap 解析一次；`args_override_self` 让同名参数后面的赢，所以
+「命令行覆盖配置」不需要为每个选项判断「命令行有没有给」。代价是布尔项必须有反义参数
+（`--no-numbers`、`--color`、`--images`），否则配置文件打开的开关命令行关不掉。
+配置只收默认样式，不收这一次调用要做什么：文件列表、`--language`、`--no-render`、
+`--list-themes`、`--check-images` 都不能写进去。
 
 ## 图片链路的取舍
 
@@ -150,12 +158,16 @@ $ sh examples/send-png.sh examples/gradient.png
 | `unicode-width` | 东亚宽度计算 |
 | `rustix` | 终端 termios（查背景色时切原始模式） |
 | `clap` | 命令行解析 |
+| `toml` | 配置文件解析 |
 | `merman` | mermaid 图解析、布局、光栅化 |
 
-依赖从 4 个涨到 12 个（248 个传递依赖），冷构建从 6 秒涨到 75 秒。
+依赖从 4 个涨到 13 个（253 个传递依赖），冷构建从 6 秒涨到 82 秒。
 
 `image` 和 `ureq` 是图片功能带来的，`merman` 是 mermaid 图带来的，`rustix` 原本就在
 `terminal_size` 的依赖树里，这次只多开了 `termios` 这一个 feature，没有新增编译单元。
+`toml` 是配置文件带来的，只开 `parse` + `serde` + `std`：解析成 `toml::Value` 就够了，
+不需要序列化和它自带的显示支持；新增的传递依赖是 serde_spanned、toml_datetime、
+toml_parser、winnow，`serde_core` 本来就在 merman 的依赖树里。
 `merman` 会带进
 resvg、tiny-skia、fontdb（找系统字体）和 lalrpop（构建期生成解析器）——它是传递依赖里
 最重的一个，也是冷构建时间翻倍的原因。

@@ -4,6 +4,7 @@
 //! 其他文件按扩展名猜语言做语法高亮，语义和 cat 保持一致：
 //! 多个文件依次输出到标准输出，读不了的文件报错后继续。
 
+mod config;
 mod highlight;
 mod image;
 mod markdown;
@@ -12,9 +13,11 @@ mod style;
 mod terminal;
 
 use clap::Parser;
+use config::Config;
 use highlight::Highlighter;
 use image::{Images, Protocol, Sizing};
 use mermaid::Theme;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,7 +34,10 @@ const MD_EXTS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn", "mdx"];
     about = "带 Markdown 渲染的 cat",
     long_about = "带 Markdown 渲染的 cat。\
                   Markdown 文件渲染成终端样式，其他文件按语言做语法高亮。\
-                  不给文件时读标准输入。"
+                  不给文件时读标准输入。\
+                  默认值也可以写在配置文件里，见 --config。",
+    // 配置文件里的参数排在真实参数前面，同名参数要让后面的赢
+    args_override_self = true
 )]
 struct Cli {
     /// 要输出的文件，`-` 表示标准输入
@@ -39,8 +45,12 @@ struct Cli {
     files: Vec<PathBuf>,
 
     /// 给每一行加行号
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, overrides_with = "no_numbers")]
     numbers: bool,
+
+    /// 不加行号，用来覆盖配置文件里的 numbers = true
+    #[arg(long, overrides_with = "numbers")]
+    no_numbers: bool,
 
     /// 强制指定语言：md、text、rust 等，不靠扩展名猜
     #[arg(short = 'l', long, value_name = "LANG")]
@@ -55,16 +65,24 @@ struct Cli {
     no_render: bool,
 
     /// 不输出颜色
-    #[arg(long)]
+    #[arg(long, overrides_with = "color")]
     no_color: bool,
+
+    /// 输出颜色，用来覆盖配置文件里的 no_color = true
+    #[arg(long, overrides_with = "no_color")]
+    color: bool,
 
     /// 列出所有可用主题后退出
     #[arg(long)]
     list_themes: bool,
 
     /// 不显示图片，只输出文字占位
-    #[arg(long)]
+    #[arg(long, overrides_with = "images")]
     no_images: bool,
+
+    /// 显示图片，用来覆盖配置文件里的 no_images = true
+    #[arg(long, overrides_with = "no_images")]
+    images: bool,
 
     /// 图片协议：auto 按终端环境猜，kitty 或 iterm2 强制指定
     #[arg(long, value_name = "PROTO", default_value = "auto")]
@@ -85,10 +103,30 @@ struct Cli {
     /// 不输出内容，只报告图片功能的每一项决策，排查用
     #[arg(long)]
     check_images: bool,
+
+    /// 配置文件（TOML）。不给时依次找 $MCAT_CONFIG、$XDG_CONFIG_HOME/mcat/config.toml、~/.config/mcat/config.toml
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let mut cli = Cli::parse_from(&argv);
+    match config::load(cli.config.as_deref()) {
+        Ok(Some((path, defaults))) => match merge_config(&argv, &defaults) {
+            Ok(merged) => cli = merged,
+            Err(e) => {
+                eprintln!("mcat: 配置文件 {} 里的配置项没能生效：", path.display());
+                let _ = e.print();
+                return ExitCode::from(2);
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("mcat: {e}");
+            return ExitCode::from(2);
+        }
+    }
 
     if cli.check_images {
         return check_images(&cli);
@@ -174,6 +212,14 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// 把配置项当成排在真实参数前面的参数，再解析一次。
+/// clap 的 `args_override_self` 让后面的真实参数覆盖配置。
+fn merge_config(argv: &[OsString], defaults: &Config) -> Result<Cli, clap::Error> {
+    let mut argv = argv.to_vec();
+    argv.splice(1..1, defaults.args().into_iter().map(OsString::from));
+    Cli::try_parse_from(argv)
 }
 
 /// 图片相对路径的基准目录：文件所在目录；标准输入用当前目录。
@@ -686,5 +732,114 @@ mod tests {
             resolve(&cli, &hl, Some(Path::new("a.rs")), "fn main() {}"),
             Mode::Raw
         ));
+    }
+
+    fn parse_with(user: &[&str], defaults: &Config) -> Result<Cli, clap::Error> {
+        let mut argv: Vec<OsString> = vec!["mcat".into()];
+        argv.extend(user.iter().map(OsString::from));
+        merge_config(&argv, defaults)
+    }
+
+    #[test]
+    fn 配置文件提供默认值() {
+        let config = Config::from_toml(
+            "theme = \"base16-mocha.dark\"\nmermaid_theme = \"dark\"\nimage_rows = 12\nnumbers = true\n",
+        )
+        .unwrap();
+        let cli = parse_with(&[], &config).unwrap();
+        assert_eq!(cli.theme, "base16-mocha.dark");
+        assert_eq!(cli.mermaid_theme, "dark");
+        assert_eq!(cli.image_rows, Some(12));
+        assert!(cli.numbers);
+    }
+
+    #[test]
+    fn 命令行覆盖配置文件里的值() {
+        let config = Config::from_toml("theme = \"base16-mocha.dark\"\nimage_rows = 12").unwrap();
+        let cli = parse_with(
+            &["--theme", "base16-ocean.dark", "--image-rows", "8"],
+            &config,
+        )
+        .unwrap();
+        assert_eq!(cli.theme, "base16-ocean.dark");
+        assert_eq!(cli.image_rows, Some(8));
+    }
+
+    #[test]
+    fn 反义参数可以关掉配置文件里的开关() {
+        let config =
+            Config::from_toml("numbers = true\nno_color = true\nno_images = true").unwrap();
+        let cli = parse_with(&["--no-numbers", "--color", "--images"], &config).unwrap();
+        assert!(!cli.numbers);
+        assert!(!cli.no_color);
+        assert!(!cli.no_images);
+    }
+
+    #[test]
+    fn 正反参数按出现顺序后者覆盖前者() {
+        assert!(
+            !parse_with(&["--numbers", "--no-numbers"], &Config::default())
+                .unwrap()
+                .numbers
+        );
+        assert!(
+            parse_with(&["--no-numbers", "--numbers"], &Config::default())
+                .unwrap()
+                .numbers
+        );
+        assert!(
+            !parse_with(&["--no-color", "--color"], &Config::default())
+                .unwrap()
+                .no_color
+        );
+        assert!(
+            parse_with(&["--images", "--no-images"], &Config::default())
+                .unwrap()
+                .no_images
+        );
+    }
+
+    #[test]
+    fn 同一种参数写两遍时后面的赢() {
+        let config = Config::from_toml("numbers = true\ntheme = \"base16-mocha.dark\"").unwrap();
+        assert!(parse_with(&["--numbers"], &config).unwrap().numbers);
+        let cli = parse_with(&["--theme", "base16-ocean.dark"], &config).unwrap();
+        assert_eq!(cli.theme, "base16-ocean.dark");
+    }
+
+    #[test]
+    fn 带空格的主题名能原样传进来() {
+        let config = Config::from_toml("theme = \"Solarized (dark)\"").unwrap();
+        let cli = parse_with(&[], &config).unwrap();
+        assert_eq!(cli.theme, "Solarized (dark)");
+    }
+
+    #[test]
+    fn 正向参数可以打开配置文件里写死的_false() {
+        let config =
+            Config::from_toml("numbers = false\nno_color = false\nno_images = false").unwrap();
+        let cli = parse_with(&["--numbers", "--no-color", "--no-images"], &config).unwrap();
+        assert!(cli.numbers);
+        assert!(cli.no_color);
+        assert!(cli.no_images);
+    }
+
+    #[test]
+    fn 配置文件和命令行同时没提时用内置默认值() {
+        let cli = parse_with(&[], &Config::default()).unwrap();
+        assert_eq!(cli.theme, "base16-ocean.dark");
+        assert_eq!(cli.mermaid_theme, "auto");
+        assert_eq!(cli.image_protocol, "auto");
+        assert!(!cli.numbers);
+        assert!(!cli.no_color);
+        assert!(!cli.no_images);
+        assert_eq!(cli.image_rows, None);
+    }
+
+    #[test]
+    fn 合并后_config_参数还在() {
+        let config = Config::from_toml("theme = \"base16-mocha.dark\"").unwrap();
+        let cli = parse_with(&["--config", "/tmp/mine.toml"], &config).unwrap();
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/tmp/mine.toml")));
     }
 }
