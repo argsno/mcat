@@ -94,6 +94,8 @@ pub enum Kind {
     Image(String),
     SoftBreak,
     HardBreak,
+    /// 行内 `<br>`：和硬换行一样另起一行，但不补反斜杠。表格单元格靠它分行。
+    LineBreak,
     Task(bool),
     FootnoteRef,
 }
@@ -227,6 +229,7 @@ impl Builder {
             }
             Event::Text(text) => self.text(text.to_string()),
             Event::Code(code) => self.push(Node::with_text(Kind::CodeSpan, code.to_string())),
+            Event::InlineHtml(html) if is_break_tag(&html) => self.push(Node::new(Kind::LineBreak)),
             Event::Html(html) | Event::InlineHtml(html) => self.text(html.to_string()),
             Event::FootnoteReference(name) => {
                 self.push(Node::with_text(Kind::FootnoteRef, name.to_string()))
@@ -262,6 +265,19 @@ fn level_number(level: HeadingLevel) -> u8 {
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
     }
+}
+
+/// 只认空的 `<br>`：`<br>`、`<br/>`、`<br />`，大小写不限。
+/// 带属性的（`<br clear="all">`）不猜，原样显示更安全。
+fn is_break_tag(html: &str) -> bool {
+    let tag = html.trim();
+    let Some(rest) = tag.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else {
+        return false;
+    };
+    rest.strip_suffix('/')
+        .unwrap_or(rest)
+        .trim()
+        .eq_ignore_ascii_case("br")
 }
 
 fn language(kind: CodeBlockKind) -> Option<String> {
@@ -705,12 +721,12 @@ impl<'a, 'i> Markdown<'a, 'i> {
             Kind::Table(a) => a.clone(),
             _ => Vec::new(),
         };
-        let head_text: Vec<String> = header
+        let head_text: Vec<Vec<String>> = header
             .iter()
             .map(|c| self.cell(c, Style::new().bold()))
             .collect();
         let head_align: Vec<Align> = header.iter().map(|c| cell_align(c, &aligns)).collect();
-        let body: Vec<(Vec<String>, Vec<Align>)> = rows
+        let body: Vec<(Vec<Vec<String>>, Vec<Align>)> = rows
             .iter()
             .map(|row| {
                 (
@@ -724,22 +740,36 @@ impl<'a, 'i> Markdown<'a, 'i> {
             .len()
             .max(body.first().map_or(0, |(cells, _)| cells.len()));
         let mut natural = vec![0usize; columns];
+        // 单元格可以有多行（`<br>` 断的），列宽取最长的那行
+        let widest = |lines: Option<&Vec<String>>| {
+            lines.map_or(0, |lines| {
+                lines
+                    .iter()
+                    .map(|line| display_width(line))
+                    .max()
+                    .unwrap_or(0)
+            })
+        };
         for (i, w) in natural.iter_mut().enumerate() {
-            let mut width = head_text.get(i).map_or(0, |t| display_width(t));
+            let mut width = widest(head_text.get(i));
             for (cells, _) in &body {
-                if let Some(t) = cells.get(i) {
-                    width = width.max(display_width(t));
-                }
+                width = width.max(widest(cells.get(i)));
             }
             *w = width.max(1);
         }
         // 放不下就把列压窄，单元格内容折行；放得下时宽度不变
         let widths = fit_widths(&natural, available(self.width, cfg, columns));
-        let wrap = |cells: &[String]| -> Vec<Vec<String>> {
+        let wrap = |cells: &[Vec<String>]| -> Vec<Vec<String>> {
             cells
                 .iter()
                 .enumerate()
-                .map(|(i, text)| wrap_styled(text, widths.get(i).copied().unwrap_or(1)))
+                .map(|(i, lines)| {
+                    let width = widths.get(i).copied().unwrap_or(1);
+                    lines
+                        .iter()
+                        .flat_map(|line| wrap_styled(line, width))
+                        .collect()
+                })
                 .collect()
         };
         let head_cells = wrap(&head_text);
@@ -760,7 +790,8 @@ impl<'a, 'i> Markdown<'a, 'i> {
         self.border(p, cfg, "└", "┴", "┘", &widths);
     }
 
-    fn cell(&self, cell: &Node, style: Style) -> String {
+    /// 单元格渲染成若干行：单元格里的 `<br>` 断行，内容再交给 `row` 逐行补齐。
+    fn cell(&self, cell: &Node, style: Style) -> Vec<String> {
         let mut sub = self.sub();
         self.inline(
             &mut sub,
@@ -771,7 +802,16 @@ impl<'a, 'i> Markdown<'a, 'i> {
                 ..Default::default()
             },
         );
-        sub.into_text().trim_end().to_string()
+        let mut lines: Vec<String> = sub
+            .into_text()
+            .split('\n')
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        // 结尾的 `<br>` 不再多占一行，和段落末尾的硬换行一致
+        while lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines
     }
 
     fn border(
@@ -876,6 +916,10 @@ impl<'a, 'i> Markdown<'a, 'i> {
                     p.newline();
                     self.open(p, cfg);
                 }
+                Kind::LineBreak => {
+                    p.newline();
+                    self.open(p, cfg);
+                }
                 Kind::Task(done) => {
                     let s = if *done {
                         Style::new().fg(C_TASK_DONE)
@@ -925,7 +969,7 @@ fn plain_text(nodes: &[Node]) -> String {
     for node in nodes {
         match &node.kind {
             Kind::Text | Kind::CodeSpan => out.push_str(&node.text),
-            Kind::SoftBreak => out.push(' '),
+            Kind::SoftBreak | Kind::LineBreak => out.push(' '),
             Kind::Task(done) => out.push_str(if *done { "☑ " } else { "☐ " }),
             _ => out.push_str(&plain_text(&node.children)),
         }
@@ -1130,6 +1174,57 @@ sequenceDiagram
             !out.contains('\u{1b}'),
             "没有图片管线就不该有控制序列：{out:?}"
         );
+    }
+
+    /// 表格单元格里没法直接换行，习惯用 `<br>` 断行。断出来的行属于同一个
+    /// 逻辑行：列宽取最长的行，行间不插横线，空出来的列补空格。
+    #[test]
+    fn 表格单元格里的_br_断行() {
+        for tag in ["<br>", "<br/>", "<br />", "<BR>"] {
+            let out = render(&format!("| 甲 | 乙 |\n|---|---|\n| 一{tag}二 | 三 |\n"));
+            assert_eq!(
+                out,
+                "┌────┬────┐\n\
+                 │ 甲 │ 乙 │\n\
+                 ├────┼────┤\n\
+                 │ 一 │ 三 │\n\
+                 │ 二 │    │\n\
+                 └────┴────┘\n",
+                "{tag}"
+            );
+        }
+    }
+
+    /// 断行之后照样按列宽折行：两套换行叠在一起，框线仍然对齐。
+    #[test]
+    fn 带_br_的单元格折行后仍然对齐() {
+        let src = "| 名 | 说明 |\n|---|---|\n| 甲 | 一二<br>三四五六七八 |\n";
+        let out = Markdown::new(highlighter(), false, None, None)
+            .with_width(Some(14))
+            .render(src);
+        assert_eq!(
+            out,
+            "┌────┬───────┐\n\
+             │ 名 │ 说明  │\n\
+             ├────┼───────┤\n\
+             │ 甲 │ 一二  │\n\
+             │    │ 三四  │\n\
+             │    │ 五六  │\n\
+             │    │ 七八  │\n\
+             └────┴───────┘\n"
+        );
+        for line in out.lines() {
+            assert_eq!(display_width(line), 14, "{line:?}");
+        }
+    }
+
+    /// 正文里的 `<br>` 也是换行，但不像硬换行那样补反斜杠；
+    /// 代码和别的行内 HTML 都不动。
+    #[test]
+    fn 行内_br_直接换行且不补反斜杠() {
+        assert_eq!(render("甲<br>乙\n"), "甲\n乙\n");
+        assert_eq!(render("`a<br>b`\n"), "a<br>b\n");
+        assert_eq!(render("a<span>b</span>\n"), "a<span>b</span>\n");
     }
 
     #[test]
