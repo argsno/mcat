@@ -18,6 +18,7 @@ $ cargo clippy --all-targets
 
 ```console
 $ mcat examples/demo.md
+$ mcat examples/demo.rst
 ```
 
 ## 代码结构
@@ -26,6 +27,8 @@ $ mcat examples/demo.md
 |---|---|
 | `src/main.rs` | 命令行、文件读取、按类型分发 |
 | `src/markdown.rs` | Markdown 解析成块/行内树，再渲染成 ANSI 文本 |
+| `src/rst.rs` | reStructuredText 解析成 docutils doctree，再渲染成 ANSI 文本 |
+| `src/table.rs` | 两种格式共用的表格列宽、折行和对齐 |
 | `src/highlight.rs` | syntect 封装：语法集、别名、内置主题、按语言逐行上色 |
 | `src/image.rs` | 图片协议、下载缓存、降采样转码 |
 | `src/mermaid.rs` | mermaid 源码 → SVG → PNG |
@@ -93,6 +96,42 @@ bat 的 fancy 语法集用不了 JavaScript (Babel) 和 PowerShell（fancy-regex
 （`--no-numbers`、`--color`、`--images`），否则配置文件打开的开关命令行关不掉。
 配置只收默认样式，不收这一次调用要做什么：文件列表、`--language`、`--no-render`、
 `--list-themes`、`--check-images` 都不能写进去。
+
+## reStructuredText 渲染的取舍
+
+**用 lsdocs-rst，不自己写子集。** 它产出的 doctree 和 Python docutils 对齐，表格、替换引用、
+脚注、行内角色和指令的边界都有现成实现；纯 Rust，只新增 `unicode-normalization`、`tinyvec` 两个传递依赖。
+代价是 API 还在 0.x，升级时要跑一遍 `cargo test` 和真实 RST 文档。
+
+**只渲染终端里有意义的节点。** 注释、链接目标、替换定义、系统消息、raw 和页眉页脚不进正文；
+未知指令用 `keep_unknown_directives(true)` 保留成 `directive` 节点，显示一行 `.. name::` 和
+它的内容，而不是把内容吞掉。Sphinx 的 `:func:`、`:ref:` 等角色注册成普通行内文字，只去掉
+角色标记，不解析交叉引用。
+
+**标题层级按 docutils 的规则。** 文档标题是 h1；有文档标题时一级章节从 h2 开始，和 docutils
+的 HTML 输出一致。`doctitle_xform` 默认开着，所以只有一个顶层章节的文档会把章节标题提升成
+文档标题——这是 docutils 的行为，不是渲染器自己判断的。
+
+**表格单独实现。** Markdown 的表格模型只有行内单元格，RST 的 `entry` 可以包含任意块，还带
+`morecols`/`morerows`。所以 `src/rst.rs` 自己搭网格：先按跨行跨列占位，再算列宽、折行、
+画框线；顶边和底边也要看首尾行有没有跨列，不能一律画 `┬`/`┴`。单元格里的图片和 mermaid
+仍然退回文字，原因是控制序列会撑破框线。
+
+**include 按源文件目录读，标准输入不读盘。** `main` 把文件路径传给 `Rst::with_source`，
+解析器用它做相对路径基准，并通过 `file_loader` 读 `include` 和 `csv-table :file:`；标准输入
+没有路径，加载器保持关闭。被禁用的指令会变成带 `literal_block` 的 `system_message`，
+渲染器保留那段原文，内容不会静默消失。
+
+**替换图片由 transforms 展开。** `.. |name| image::` 在 `transforms(true)` 之后已经变成正文
+里的 inline image，渲染器不需要再维护替换表；`--check-images` 收集图片时跳过
+`substitution_definition`，避免同一张图报两次。
+
+**代码块语言来自 `classes`。** docutils 把 `.. code-block:: rust` 记成
+`classes="code rust"`，取第一个不是 `code` 的类名交给 syntect；`.. code-block:: mermaid`
+也走同一条判断。
+
+**列宽和折行与 Markdown 共用 `src/table.rs`。** 两边如果各算一套，终端里同一张表在
+两种格式下会出现不同的框线宽度；改下限、对齐或折行规则时只需要动一处。
 
 ## 图片链路的取舍
 
@@ -167,6 +206,7 @@ $ sh examples/send-png.sh examples/gradient.png
 | `pulldown-cmark` | CommonMark 解析 |
 | `syntect` | 语法高亮（fancy-regex 后端，无 C 依赖） |
 | `two-face` | 语法定义集（bat 的语法集，fancy 变体，无 C 依赖） |
+| `lsdocs-rst` | reStructuredText 解析（docutils 的 Rust 移植，无 C 依赖） |
 | `image` | 非 PNG 格式转码 + 降采样 |
 | `ureq` | 下载远程图片（rustls，无 C 依赖） |
 | `terminal_size` | 终端宽度 |
@@ -178,13 +218,15 @@ $ sh examples/send-png.sh examples/gradient.png
 | `toml` | 配置文件解析 |
 | `merman` | mermaid 图解析、布局、光栅化 |
 
-依赖从 4 个涨到 13 个（253 个传递依赖），冷构建从 6 秒涨到 82 秒。
+依赖从 4 个涨到 14 个（Cargo.lock 里 370 个包），冷构建从 6 秒涨到 82 秒左右。
 
 `image` 和 `ureq` 是图片功能带来的，`merman` 是 mermaid 图带来的，`rustix` 原本就在
 `terminal_size` 的依赖树里，这次只多开了 `termios` 这一个 feature，没有新增编译单元。
 `toml` 是配置文件带来的，只开 `parse` + `serde` + `std`：解析成 `toml::Value` 就够了，
 不需要序列化和它自带的显示支持；新增的传递依赖是 serde_spanned、toml_datetime、
 toml_parser、winnow，`serde_core` 本来就在 merman 的依赖树里。
+`lsdocs-rst` 是 reStructuredText 带来的，默认特性下只新增 `unicode-normalization`
+和 `tinyvec` 两个编译单元，没有 C 依赖。
 `merman` 会带进
 resvg、tiny-skia、fontdb（找系统字体）和 lalrpop（构建期生成解析器）——它是传递依赖里
 最重的一个，也是冷构建时间翻倍的原因。
