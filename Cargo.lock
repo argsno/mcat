@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "mcat"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.23.1",
  "clap",
