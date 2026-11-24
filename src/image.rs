@@ -137,9 +137,15 @@ impl Images {
         self.protocol
     }
 
-    /// Markdown 里嵌的图片。
+    /// 文档里嵌的图片（行内、表格里）：给它留出正文空间。
     pub fn for_file(&self, base: PathBuf) -> Renderer<'_> {
         self.renderer(base, self.embedded)
+    }
+
+    /// 文档里独占一段的图片：按单独看一张图的高度预算算，
+    /// 否则竖图会被默认的 20 行压得很小。
+    pub fn for_block(&self, base: PathBuf) -> Renderer<'_> {
+        self.renderer(base, self.full)
     }
 
     /// 单独看一张图片，按铺满终端算。
@@ -177,7 +183,19 @@ pub struct Renderer<'a> {
     /// 相对路径的基准目录（Markdown 文件所在目录）。
     base: PathBuf,
     /// 同一次运行里，同一张图只处理一次。
-    seen: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+    seen: std::cell::RefCell<std::collections::HashMap<String, Option<ImageOutput>>>,
+}
+
+/// 画一张图需要的控制序列，以及画完之后要补几行。
+///
+/// Kitty 的高度受约束时用 `C=1` 让终端不要自己移动光标，由这里显式换行；
+/// 否则光标一旦越过屏幕（`--image-rows` 大于终端高度时很容易发生），
+/// 终端对光标位置的处理就没有定义了，后面的文字会压在图上。
+#[derive(Clone, Debug)]
+pub struct ImageOutput {
+    pub sequence: String,
+    /// 写完控制序列后要换多少行。iTerm2 和按列宽约束的 Kitty 图是 1。
+    pub advance: usize,
 }
 
 /// 一张图准备就绪之后的全部信息，`--check-images` 靠它报告。
@@ -196,6 +214,8 @@ pub struct Prepared {
     pub cells: (usize, usize),
     /// 实际发给终端的是哪个维度。
     pub axis: Axis,
+    /// 画完之后要换几行（见 `ImageOutput`）。
+    pub advance: usize,
     /// 原始字节数与 base64 之后的字符数。
     pub payload: usize,
     pub encoded: usize,
@@ -212,14 +232,17 @@ pub struct Prepared {
 impl Renderer<'_> {
     /// 渲染一张图片。拿不到数据或者格式不认识时返回 `None`，
     /// 调用方据此退回文字占位。
-    pub fn render(&self, url: &str) -> Option<String> {
+    pub fn render(&self, url: &str) -> Option<ImageOutput> {
         // 缓存按解析后的实际文件做键：`./a.png` 和 `a.png` 是同一张图，
         // 不该处理两遍
         let key = self.identity(url);
         if let Some(cached) = self.seen.borrow().get(&key) {
             return cached.clone();
         }
-        let rendered = self.prepare(url).ok().map(|p| p.sequence);
+        let rendered = self.prepare(url).ok().map(|p| ImageOutput {
+            sequence: p.sequence,
+            advance: p.advance,
+        });
         self.seen.borrow_mut().insert(key, rendered.clone());
         rendered
     }
@@ -235,18 +258,21 @@ impl Renderer<'_> {
 
     /// 直接编码已经在内存里的图片字节（mermaid 图走这条路）。
     /// `identity` 决定终端图片 id，所以同一张图必须每次算出同一个值。
-    pub fn render_png(&self, identity: &str, png: Vec<u8>) -> Option<String> {
+    pub fn render_png(&self, identity: &str, png: Vec<u8>) -> Option<ImageOutput> {
         if let Some(cached) = self.seen.borrow().get(identity) {
             return cached.clone();
         }
-        let sequence = self
+        let rendered = self
             .encode(identity, &png, None, false)
             .ok()
-            .map(|p| p.sequence);
+            .map(|p| ImageOutput {
+                sequence: p.sequence,
+                advance: p.advance,
+            });
         self.seen
             .borrow_mut()
-            .insert(identity.to_string(), sequence.clone());
-        sequence
+            .insert(identity.to_string(), rendered.clone());
+        rendered
     }
 
     /// 图片渲染的每一步。`Err` 里是给用户看的原因。
@@ -270,12 +296,15 @@ impl Renderer<'_> {
             return Err("尺寸算出来是 0".to_string());
         }
         let encoded = BASE64.encode(&payload);
+        // 高度受约束的 Kitty 图由客户端换行，避免光标越过屏幕后位置未定义
+        let hold_cursor = self.shared.protocol == Protocol::Kitty && fit.axis == Axis::Rows;
         let sequence = match self.shared.protocol {
-            Protocol::Kitty => kitty_sequence(identity, &encoded, fit),
+            Protocol::Kitty => kitty_sequence(identity, &encoded, fit, hold_cursor),
             // iTerm2 那边靠 preserveAspectRatio，同时给两个维度
             Protocol::Iterm2 => iterm2_sequence(&encoded, fit.cols, fit.rows, payload.len()),
         };
         Ok(Prepared {
+            advance: if hold_cursor { fit.value + 1 } else { 1 },
             chunks: sequence.matches("\x1b_G").count().max(1),
             sequence,
             format,
@@ -457,12 +486,13 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
 /// 同时发 `c` 和 `r` 时规范说会 letterbox，实测 Ghostty 并不如此——
 /// 宽高比不匹配时图直接消失，匹配时也会被拉伸变形。只发一个维度最稳，
 /// 因为终端最清楚自己字符格的实际像素尺寸。
-fn kitty_sequence(url: &str, payload: &str, fit: Fit) -> String {
+fn kitty_sequence(url: &str, payload: &str, fit: Fit, hold_cursor: bool) -> String {
     let id = image_id(url);
     let size = match fit.axis {
         Axis::Columns => format!("c={}", fit.value),
         Axis::Rows => format!("r={}", fit.value),
     };
+    let cursor = if hold_cursor { "C=1," } else { "" };
     let mut out = String::new();
     let mut chunks = payload.as_bytes().chunks(KITTY_CHUNK);
     let total = payload.len().div_ceil(KITTY_CHUNK);
@@ -471,7 +501,7 @@ fn kitty_sequence(url: &str, payload: &str, fit: Fit) -> String {
         // m=1 表示后面还有数据，m=0 表示这是最后一块
         if i == 0 {
             out.push_str(&format!(
-                "\x1b_Ga=T,f=100,i={id},q=2,{size},m={};",
+                "\x1b_Ga=T,f=100,i={id},q=2,{cursor}{size},m={};",
                 u8::from(!last)
             ));
         } else {
@@ -682,7 +712,7 @@ mod tests {
     #[test]
     fn kitty_单块载荷不分段() {
         let payload = BASE64.encode([0u8; 100]);
-        let seq = kitty_sequence("x", &payload, fit(10, 5));
+        let seq = kitty_sequence("x", &payload, fit(10, 5), false);
         assert_eq!(seq.matches("\x1b_G").count(), 1);
         assert!(seq.starts_with("\x1b_Ga=T,f=100,"));
         assert!(seq.ends_with("\x1b\\"));
@@ -693,7 +723,7 @@ mod tests {
     #[test]
     fn kitty_只发一个维度() {
         let payload = BASE64.encode([0u8; 100]);
-        let seq = kitty_sequence("x", &payload, fit(20, 7));
+        let seq = kitty_sequence("x", &payload, fit(20, 7), false);
         assert!(seq.contains("c=20,"), "{seq:?}");
         assert!(!seq.contains("r="), "{seq:?}");
 
@@ -703,9 +733,10 @@ mod tests {
             cols: 39,
             rows: 13,
         };
-        let seq = kitty_sequence("x", &payload, by_rows);
+        let seq = kitty_sequence("x", &payload, by_rows, true);
         assert!(seq.contains("r=13,"), "{seq:?}");
         assert!(!seq.contains("c="), "{seq:?}");
+        assert!(seq.contains("C=1,"), "{seq:?}");
     }
 
     /// m=0 表示「这是最后一块」。单块图片也必须这么发：
@@ -713,7 +744,7 @@ mod tests {
     #[test]
     fn kitty_单块必须标成最后一块() {
         let payload = BASE64.encode([0u8; 100]);
-        let seq = kitty_sequence("x", &payload, fit(10, 5));
+        let seq = kitty_sequence("x", &payload, fit(10, 5), false);
         assert!(seq.contains("m=0;"), "{seq:?}");
         assert!(!seq.contains("m=1;"), "{seq:?}");
     }
@@ -722,7 +753,7 @@ mod tests {
     fn kitty_大载荷按四千字节分块() {
         // 10000 字节编码成 base64 约 13336 字符，4096 一块是 4 块
         let payload = BASE64.encode([0u8; 10000]);
-        let seq = kitty_sequence("x", &payload, fit(10, 5));
+        let seq = kitty_sequence("x", &payload, fit(10, 5), false);
         assert_eq!(seq.matches("\x1b_G").count(), 4);
         // 除最后一块外都是 m=1
         assert_eq!(seq.matches("m=1;").count(), 3);
@@ -736,7 +767,7 @@ mod tests {
     #[test]
     fn kitty_只有第一块带完整控制数据() {
         let payload = BASE64.encode([0u8; 10000]);
-        let seq = kitty_sequence("x", &payload, fit(10, 5));
+        let seq = kitty_sequence("x", &payload, fit(10, 5), false);
         assert_eq!(seq.matches("a=T").count(), 1, "a=T 只能出现一次");
         assert_eq!(seq.matches("f=100").count(), 1, "f=100 只能出现一次");
         assert_eq!(seq.matches("i=").count(), 1, "i= 只能出现一次");
@@ -931,8 +962,34 @@ mod report_tests {
         // 48×24 铺满 80 列只要 10 行，20 行的上限用不满，所以按列数约束
         assert_eq!(info.axis, Axis::Columns);
         assert_eq!(info.cells, (80, 20));
+        assert_eq!(info.advance, 1);
+        assert!(!info.sequence.contains("C=1,"));
         assert!(info.sequence.starts_with("\x1b_G"));
         assert_eq!(info.sequence.matches("\x1b_G").count(), info.chunks);
+    }
+
+    /// 高度被预算截断时，终端自己移动光标可能越过屏幕，位置就未定义了。
+    /// 这时要用 C=1 并自己补行，后面的文字才不会压在图上。
+    #[test]
+    fn 高度受限的图自己换行() {
+        let dir = std::env::temp_dir();
+        let png = dir.join("mcat-test-tall.png");
+        let img = image::RgbaImage::from_pixel(40, 200, image::Rgba([1, 2, 3, 255]));
+        let mut buf = Vec::new();
+        PngEncoder::new(&mut buf)
+            .write_image(img.as_raw(), 40, 200, ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&png, buf).unwrap();
+
+        let info = images()
+            .for_file(dir.clone())
+            .prepare("mcat-test-tall.png")
+            .expect("刚写的文件应该能读");
+        let _ = std::fs::remove_file(&png);
+
+        assert_eq!(info.axis, Axis::Rows);
+        assert!(info.sequence.contains("C=1,"), "{:?}", info.sequence);
+        assert_eq!(info.advance, info.cells.1 + 1);
     }
 }
 

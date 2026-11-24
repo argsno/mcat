@@ -92,7 +92,8 @@ struct Cli {
     #[arg(long, value_name = "PROTO", default_value = "auto")]
     image_protocol: String,
 
-    /// 图片最多占多少行。不给时：嵌在 Markdown 里用 20，单独看一张图铺满终端
+    /// 图片最多占多少行。不给时：行内图片用 20，独占一段的图和单独看图铺满终端。
+    /// 超过终端高度时按终端高度算
     #[arg(long, value_name = "N")]
     image_rows: Option<usize>,
 
@@ -318,7 +319,7 @@ fn check_images(cli: &Cli) -> ExitCode {
     let sizing = images.sizing();
     let given = |v: Option<usize>| v.map_or("自动".to_string(), |n| n.to_string());
     println!(
-        "显示上限    嵌入 {}x{} 格，单独看图 {}x{} 格（--image-cols {}，--image-rows {}）",
+        "显示上限    行内 {}x{} 格，独占一段/单独看图 {}x{} 格（--image-cols {}，--image-rows {}）",
         sizing.max_cols,
         sizing.max_rows,
         images.full_sizing().max_cols,
@@ -345,24 +346,37 @@ fn check_images(cli: &Cli) -> ExitCode {
         // 文件本身就是图片时没有文档树，直接把它当成唯一一张待查的图
         let standalone = Images::is_image(source.as_bytes());
         let rst = is_rst(cli, path);
-        let (urls, renderer) = if standalone {
-            (
-                vec![path.to_string_lossy().into_owned()],
-                images.for_image(),
-            )
+        let standalone_renderer = standalone.then(|| images.for_image());
+        let embedded = (!standalone).then(|| images.for_file(base_dir(Some(path))));
+        let block = (!standalone).then(|| images.for_block(base_dir(Some(path))));
+        let urls = if standalone {
+            vec![(path.to_string_lossy().into_owned(), true)]
+        } else if rst {
+            rst::image_urls(&source, Some(path))
         } else {
-            let renderer = images.for_file(base_dir(Some(path)));
-            let urls = if rst {
-                rst::image_urls(&source, Some(path))
-            } else {
-                markdown::image_urls(&source)
-            };
-            (urls, renderer)
+            markdown::image_urls(&source)
         };
         let self_protocol = images.protocol();
-        for url in urls {
+        for (url, is_block) in urls {
+            let renderer = if let Some(renderer) = &standalone_renderer {
+                renderer
+            } else if is_block {
+                block.as_ref().expect("非单独看图时存在")
+            } else {
+                embedded.as_ref().expect("非单独看图时存在")
+            };
             total += 1;
             println!("\n{}", url);
+            println!(
+                "  位置      {}",
+                if standalone {
+                    "单独看图（按整屏高度）"
+                } else if is_block {
+                    "独占一段（按整屏高度）"
+                } else {
+                    "行内（默认最多 20 行）"
+                }
+            );
             match renderer.prepare(&url) {
                 Ok(info) => {
                     ok += 1;
@@ -458,12 +472,12 @@ fn check_images(cli: &Cli) -> ExitCode {
                         let encoder = images.for_file(base_dir(Some(path)));
                         let payload = info.png.len();
                         match encoder.render_png(&mermaid::identity(&block), info.png) {
-                            Some(sequence) => {
+                            Some(output) => {
                                 println!(
                                     "  载荷      {payload} 字节 -> base64 {} 字符",
                                     payload.div_ceil(3) * 4
                                 );
-                                println!("  序列      {}", preview(&sequence));
+                                println!("  序列      {}", preview(&output.sequence));
                                 println!("  结论      ✓ 会输出图形序列");
                             }
                             None => {
@@ -538,15 +552,18 @@ fn image_backend(cli: &Cli) -> Option<Images> {
     let term_cols = term.map_or(80, |(w, _)| w.0 as usize);
     let term_rows = term.map_or(24, |(_, h)| h.0 as usize);
 
-    // 嵌在 Markdown 里的图要给正文留位置，单独看一张图就铺满
+    // 行内图片要给正文留位置；独占一段的图和单独看一张图铺满终端。
+    // --image-rows 不能超过终端高度：超出屏幕的图光标位置没有定义，
+    // 后面的文字会压在图上。
     let cols = cli.image_cols.unwrap_or(term_cols).clamp(1, 1000);
+    let row_cap = term_rows.max(1);
     let embedded = Sizing {
         max_cols: cols,
-        max_rows: cli.image_rows.unwrap_or(20).max(1),
+        max_rows: cli.image_rows.unwrap_or(20).min(row_cap).max(1),
     };
     let full = Sizing {
         max_cols: cols,
-        max_rows: cli.image_rows.unwrap_or(term_rows).max(1),
+        max_rows: cli.image_rows.unwrap_or(row_cap).min(row_cap).max(1),
     };
     Some(Images::new(protocol, embedded, full))
 }
@@ -576,7 +593,9 @@ fn emit(
             match renderer.prepare(&path.to_string_lossy()) {
                 Ok(info) => {
                     out.write_control(&info.sequence);
-                    out.newline();
+                    for _ in 0..info.advance {
+                        out.newline();
+                    }
                 }
                 Err(reason) => report(path, &io::Error::other(reason)),
             }
@@ -597,26 +616,32 @@ fn emit(
     match resolve(cli, hl, path, first_line) {
         Mode::Markdown => {
             // 图片相对路径以 Markdown 文件所在目录为基准
-            let renderer = images.map(|images| images.for_file(base_dir(path)));
+            let base = base_dir(path);
+            let renderer = images.map(|images| images.for_file(base.clone()));
+            let block_renderer = images.map(|images| images.for_block(base));
             let rendered = markdown::Markdown::new(
                 hl,
                 !cli.no_color,
                 renderer.as_ref(),
                 diagrams.map(|(renderer, sizing)| (renderer, *sizing)),
             )
+            .with_block_images(block_renderer.as_ref())
             .with_width(table_width(cli))
             .render(text);
             out.write_block(&rendered);
         }
         Mode::Rst => {
             // 图片相对路径以 RST 文件所在目录为基准，和 Markdown 一致
-            let renderer = images.map(|images| images.for_file(base_dir(path)));
+            let base = base_dir(path);
+            let renderer = images.map(|images| images.for_file(base.clone()));
+            let block_renderer = images.map(|images| images.for_block(base));
             let renderer = rst::Rst::new(
                 hl,
                 !cli.no_color,
                 renderer.as_ref(),
                 diagrams.map(|(renderer, sizing)| (renderer, *sizing)),
             )
+            .with_block_images(block_renderer.as_ref())
             .with_width(table_width(cli));
             let mut renderer = match path {
                 Some(path) => renderer.with_source(path),

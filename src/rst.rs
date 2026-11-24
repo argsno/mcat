@@ -5,7 +5,7 @@
 //! 模型不同，所以这里单独渲染，只复用 `markdown` 的配色和 `table` 的排版。
 
 use crate::highlight::{Highlighter, write_code_prefix};
-use crate::image::{Renderer as ImageRenderer, Sizing};
+use crate::image::{ImageOutput, Renderer as ImageRenderer, Sizing};
 use crate::markdown::{
     MERMAID_LANG, RULE_WIDTH, S_BORDER, S_BULLET, S_CODE_SPAN, S_IMAGE, S_LINK, S_MUTED, S_RULE,
     heading_style,
@@ -25,6 +25,8 @@ pub struct Rst<'a, 'i> {
     hl: &'a Highlighter,
     color: bool,
     images: Option<&'i ImageRenderer<'i>>,
+    /// 独占一段的图片用这份预算，留空时退回 `images`。
+    block_images: Option<&'i ImageRenderer<'i>>,
     diagrams: Option<(&'i MermaidRenderer, Sizing)>,
     width: Option<usize>,
     /// 源文件路径。给了就允许 `.. include::` 按它所在目录读文件。
@@ -42,10 +44,17 @@ impl<'a, 'i> Rst<'a, 'i> {
             hl,
             color,
             images,
+            block_images: None,
             diagrams,
             width: None,
             source: None,
         }
+    }
+
+    /// 独占一段的图片（图、Figure、只有一张图的段落）用单独的高度预算。
+    pub fn with_block_images(mut self, images: Option<&'i ImageRenderer<'i>>) -> Self {
+        self.block_images = images;
+        self
     }
 
     /// 记下源文件路径：`include`、`csv-table :file:` 之类的指令要按它
@@ -107,7 +116,7 @@ impl<'a, 'i> Rst<'a, 'i> {
         Painter::new(TextBuf::new()).with_color(self.color)
     }
 
-    fn diagram(&self, source: &str) -> Option<String> {
+    fn diagram(&self, source: &str) -> Option<ImageOutput> {
         let (renderer, sizing) = self.diagrams?;
         let png = renderer.png(source, &sizing)?;
         self.images?
@@ -138,6 +147,12 @@ impl<'a, 'i> Rst<'a, 'i> {
             Kind::Paragraph => {
                 if spaced {
                     p.blank_line();
+                }
+                if let Some(image) = only_image(&e.children) {
+                    if !self.image(p, image, cfg.in_table, true) {
+                        p.newline();
+                    }
+                    return;
                 }
                 self.open(p, cfg);
                 self.inline(p, &e.children, Style::new(), cfg);
@@ -181,7 +196,7 @@ impl<'a, 'i> Rst<'a, 'i> {
                 if spaced {
                     p.blank_line();
                 }
-                if !self.image(p, e, cfg.in_table) {
+                if !self.image(p, e, cfg.in_table, true) {
                     p.newline();
                 }
             }
@@ -514,10 +529,12 @@ impl<'a, 'i> Rst<'a, 'i> {
         let lang = literal_language(e);
         if lang.as_deref() == Some(MERMAID_LANG)
             && !cfg.in_table
-            && let Some(sequence) = self.diagram(&text)
+            && let Some(output) = self.diagram(&text)
         {
-            p.write_control(&sequence);
-            p.newline();
+            p.write_control(&output.sequence);
+            for _ in 0..output.advance {
+                p.newline();
+            }
             return;
         }
         let stripe = self.hl.stripe();
@@ -607,7 +624,7 @@ impl<'a, 'i> Rst<'a, 'i> {
             p.blank_line();
         }
         if let Some(image) = find_child(e, Kind::Image)
-            && !self.image(p, image, cfg.in_table)
+            && !self.image(p, image, cfg.in_table, true)
         {
             p.newline();
         }
@@ -786,7 +803,7 @@ impl<'a, 'i> Rst<'a, 'i> {
                 self.inline(p, &e.children, style, cfg)
             }
             Kind::Image => {
-                self.image(p, e, cfg.in_table);
+                self.image(p, e, cfg.in_table, false);
             }
             Kind::Target | Kind::Raw => {}
             Kind::Problematic => p.write(style, &oneline(&e.astext())),
@@ -796,15 +813,22 @@ impl<'a, 'i> Rst<'a, 'i> {
 
     /// 画一张图。返回 true 表示已经写出图形协议的控制序列（并换行），
     /// false 表示只写了文字占位，换行由调用方决定。
-    fn image(&self, p: &mut Painter<TextBuf>, e: &Element, in_table: bool) -> bool {
+    fn image(&self, p: &mut Painter<TextBuf>, e: &Element, in_table: bool, block: bool) -> bool {
         let uri = e.attributes.get_str("uri").unwrap_or_default();
         let alt = e.attributes.get_str("alt").unwrap_or_default();
+        let renderer = if block {
+            self.block_images.or(self.images)
+        } else {
+            self.images
+        };
         if !in_table
-            && let Some(images) = self.images
-            && let Some(sequence) = images.render(uri)
+            && let Some(images) = renderer
+            && let Some(output) = images.render(uri)
         {
-            p.write_control(&sequence);
-            p.newline();
+            p.write_control(&output.sequence);
+            for _ in 0..output.advance {
+                p.newline();
+            }
             return true;
         }
         p.write(S_IMAGE, "[image] ");
@@ -1336,6 +1360,18 @@ fn is_block_kind(kind: &Kind) -> bool {
     )
 }
 
+fn only_image(nodes: &[Node]) -> Option<&Element> {
+    let mut found = None;
+    for node in nodes {
+        match node {
+            Node::Element(e) if e.kind == Kind::Image && found.is_none() => found = Some(e),
+            Node::Text(t) if t.value.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+    found
+}
+
 fn oneline(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
@@ -1427,23 +1463,35 @@ fn parse(src: &str, source: Option<&Path>) -> Element {
 }
 
 /// 按出现顺序收集文档里引用的所有图片，供 `--check-images` 报告。
-pub fn image_urls(src: &str, source: Option<&Path>) -> Vec<String> {
-    fn walk(e: &Element, in_substitution: bool, out: &mut Vec<String>) {
+/// 第二项表示这张图是否独占一段：独占一段的图用整屏高度预算。
+pub fn image_urls(src: &str, source: Option<&Path>) -> Vec<(String, bool)> {
+    fn walk(e: &Element, in_substitution: bool, block: bool, out: &mut Vec<(String, bool)>) {
         let in_substitution = in_substitution || e.kind == Kind::SubstitutionDefinition;
+        if e.kind == Kind::Paragraph
+            && !in_substitution
+            && let Some(image) = only_image(&e.children)
+            && let Some(uri) = image.attributes.get_str("uri")
+            && !uri.is_empty()
+        {
+            out.push((uri.to_string(), true));
+            return;
+        }
         if e.kind == Kind::Image
             && !in_substitution
             && let Some(uri) = e.attributes.get_str("uri")
             && !uri.is_empty()
         {
-            out.push(uri.to_string());
+            out.push((uri.to_string(), block));
+            return;
         }
         for child in e.elements() {
-            walk(child, in_substitution, out);
+            // 段落里的图片是行内图；其他块里的 Image 按整段图算
+            walk(child, in_substitution, e.kind != Kind::Paragraph, out);
         }
     }
     let doc = parse(src, source);
     let mut out = Vec::new();
-    walk(&doc, false, &mut out);
+    walk(&doc, false, true, &mut out);
     out
 }
 
@@ -1691,8 +1739,43 @@ mod tests {
         let src = ".. |i| image:: a.png\n   :alt: x\n\n.. image:: b.png\n\n正文 |i|。\n";
         let urls = image_urls(src, None);
         assert_eq!(urls.len(), 2, "{urls:?}");
-        assert!(urls.contains(&"a.png".to_string()), "{urls:?}");
-        assert!(urls.contains(&"b.png".to_string()), "{urls:?}");
+        assert!(urls.contains(&("a.png".to_string(), false)), "{urls:?}");
+        assert!(urls.contains(&("b.png".to_string(), true)), "{urls:?}");
+    }
+
+    #[test]
+    fn 独占一段的图片用整屏高度() {
+        use crate::image::{Images, Protocol};
+        let images = Images::new(
+            Protocol::Kitty,
+            Sizing {
+                max_cols: 10,
+                max_rows: 5,
+            },
+            Sizing {
+                max_cols: 40,
+                max_rows: 20,
+            },
+        );
+        let embedded = images.for_file(PathBuf::from("examples"));
+        let block = images.for_block(PathBuf::from("examples"));
+        let mut rst =
+            Rst::new(highlighter(), false, Some(&embedded), None).with_block_images(Some(&block));
+        let out = rst.render("|i|\n\n.. |i| image:: gradient.png\n");
+        assert!(out.contains("c=40"), "{out:?}");
+        assert!(!out.contains("c=10"), "{out:?}");
+
+        let mut rst =
+            Rst::new(highlighter(), false, Some(&embedded), None).with_block_images(Some(&block));
+        let out = rst.render("正文 |i|。\n\n.. |i| image:: gradient.png\n");
+        assert!(out.contains("c=10"), "{out:?}");
+        assert!(!out.contains("c=40"), "{out:?}");
+    }
+
+    #[test]
+    fn 独占一段的图片标记为整段() {
+        let urls = image_urls(".. |i| image:: a.png\n\n|i|\n", None);
+        assert_eq!(urls, vec![("a.png".to_string(), true)]);
     }
 
     #[test]

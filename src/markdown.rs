@@ -4,7 +4,7 @@
 //! 再递归渲染成带 ANSI 样式的文本。代码块交给 syntect 上色。
 
 use crate::highlight::{Highlighter, write_code_prefix};
-use crate::image::{Renderer as ImageRenderer, Sizing};
+use crate::image::{ImageOutput, Renderer as ImageRenderer, Sizing};
 use crate::mermaid::Renderer as MermaidRenderer;
 use crate::style::{Color, Painter, Style, TextBuf, display_width, wrap_styled};
 use crate::table::{Align, available, fit_widths, pad};
@@ -371,10 +371,18 @@ pub fn parse(src: &str) -> Node {
 }
 
 /// 按出现顺序收集文档里引用的所有图片，供 `--check-images` 报告。
-pub fn image_urls(src: &str) -> Vec<String> {
-    fn walk(node: &Node, out: &mut Vec<String>) {
+/// 第二项表示这张图是否独占一段：独占一段的图可以用整屏高度。
+pub fn image_urls(src: &str) -> Vec<(String, bool)> {
+    fn walk(node: &Node, out: &mut Vec<(String, bool)>) {
+        if node.kind == Kind::Paragraph
+            && let Some(image) = only_image(&node.children)
+            && let Kind::Image(url) = &image.kind
+        {
+            out.push((url.clone(), true));
+            return;
+        }
         if let Kind::Image(url) = &node.kind {
-            out.push(url.clone());
+            out.push((url.clone(), false));
         }
         for child in &node.children {
             walk(child, out);
@@ -430,6 +438,8 @@ pub struct Markdown<'a, 'i> {
     notes: HashMap<String, usize>,
     /// 有值时把图片渲染成终端图形协议的控制序列。
     images: Option<&'i ImageRenderer<'i>>,
+    /// 独占一段的图片用这份尺寸预算，留空时退回 `images`。
+    block_images: Option<&'i ImageRenderer<'i>>,
     /// 有值时把 ```mermaid 代码块画成图。渲染器和它该用的尺寸上限。
     diagrams: Option<(&'i MermaidRenderer, Sizing)>,
     /// 终端宽度：表格比它宽时把单元格内容折行。管道里给 `None`，不折行。
@@ -448,9 +458,16 @@ impl<'a, 'i> Markdown<'a, 'i> {
             color,
             notes: HashMap::new(),
             images,
+            block_images: None,
             diagrams,
             width: None,
         }
+    }
+
+    /// 独占一段的图片（图、Figure、只有一张图的段落）用单独的高度预算。
+    pub fn with_block_images(mut self, images: Option<&'i ImageRenderer<'i>>) -> Self {
+        self.block_images = images;
+        self
     }
 
     /// 告诉渲染器终端有多宽，放不下的表格会折行。不给就一律不折。
@@ -487,7 +504,7 @@ impl<'a, 'i> Markdown<'a, 'i> {
     /// 两步：先渲染成 PNG，再交给图片管线编码。和图片共用同一套
     /// 分块、尺寸和 id 计算，所以行为一致。任何一步走不通返回 `None`，
     /// 调用方退回显示源码。
-    fn diagram(&self, source: &str) -> Option<String> {
+    fn diagram(&self, source: &str) -> Option<ImageOutput> {
         let (renderer, sizing) = self.diagrams?;
         let png = renderer.png(source, &sizing)?;
         self.images?
@@ -512,6 +529,12 @@ impl<'a, 'i> Markdown<'a, 'i> {
             Kind::Paragraph => {
                 if spaced {
                     p.blank_line();
+                }
+                if let Some(image) = only_image(&node.children) {
+                    if !self.image(p, image, Style::new(), cfg, true) {
+                        p.newline();
+                    }
+                    return;
                 }
                 self.open(p, cfg);
                 self.inline(p, &node.children, Style::new(), cfg);
@@ -542,11 +565,13 @@ impl<'a, 'i> Markdown<'a, 'i> {
                 // 表格单元格里不嵌图：控制序列会撑破单元格。
                 if lang.as_deref() == Some(MERMAID_LANG)
                     && !cfg.in_table
-                    && let Some(sequence) = self.diagram(&node.text)
+                    && let Some(output) = self.diagram(&node.text)
                 {
                     self.open(p, cfg);
-                    p.write_control(&sequence);
-                    p.newline();
+                    p.write_control(&output.sequence);
+                    for _ in 0..output.advance {
+                        p.newline();
+                    }
                     return;
                 }
                 // 认不出语言时保持原样，没必要把每个字符都涂成同一个颜色
@@ -889,28 +914,8 @@ impl<'a, 'i> Markdown<'a, 'i> {
                         p.write(style.merge(S_MUTED), &format!(" ({url})"));
                     }
                 }
-                Kind::Image(url) => {
-                    // 终端能显示就直接画出来，否则退回文字占位
-                    let drawn = if cfg.in_table {
-                        None
-                    } else {
-                        self.images.and_then(|images| images.render(url))
-                    };
-                    if let Some(sequence) = drawn {
-                        p.write_control(&sequence);
-                        p.newline();
-                        continue;
-                    }
-                    let alt = plain_text(&node.children);
-                    p.write(style.merge(S_IMAGE), "[image] ");
-                    if alt.is_empty() {
-                        p.write(style.merge(S_MUTED), "无描述");
-                    } else {
-                        p.write(style.merge(S_LINK), &alt);
-                    }
-                    if !url.is_empty() && url != &alt {
-                        p.write(style.merge(S_MUTED), &format!(" ({url})"));
-                    }
+                Kind::Image(_) => {
+                    self.image(p, node, style, cfg, false);
                 }
                 Kind::SoftBreak => p.write(style, " "),
                 Kind::HardBreak => {
@@ -941,6 +946,50 @@ impl<'a, 'i> Markdown<'a, 'i> {
     }
 }
 
+impl Markdown<'_, '_> {
+    /// 画一张图。返回 true 表示已经写出图形协议的控制序列（并换行）。
+    fn image(
+        &self,
+        p: &mut Painter<TextBuf>,
+        node: &Node,
+        style: Style,
+        cfg: &Cfg,
+        block: bool,
+    ) -> bool {
+        let Kind::Image(url) = &node.kind else {
+            return false;
+        };
+        let renderer = if block {
+            self.block_images.or(self.images)
+        } else {
+            self.images
+        };
+        let drawn = if cfg.in_table {
+            None
+        } else {
+            renderer.and_then(|images| images.render(url))
+        };
+        if let Some(output) = drawn {
+            p.write_control(&output.sequence);
+            for _ in 0..output.advance {
+                p.newline();
+            }
+            return true;
+        }
+        let alt = plain_text(&node.children);
+        p.write(style.merge(S_IMAGE), "[image] ");
+        if alt.is_empty() {
+            p.write(style.merge(S_MUTED), "无描述");
+        } else {
+            p.write(style.merge(S_LINK), &alt);
+        }
+        if !url.is_empty() && url != &alt {
+            p.write(style.merge(S_MUTED), &format!(" ({url})"));
+        }
+        false
+    }
+}
+
 fn collect_footnotes(node: &Node, out: &mut HashMap<String, usize>, counter: &mut usize) {
     if node.is(&Kind::FootnoteDef) {
         *counter += 1;
@@ -963,6 +1012,20 @@ impl Markdown<'_, '_> {
             }
         }
     }
+}
+
+/// 段落里是否只有一张图（允许空白文本）。独占一段的图按整屏高度画。
+fn only_image(nodes: &[Node]) -> Option<&Node> {
+    let mut found = None;
+    for node in nodes {
+        match &node.kind {
+            Kind::Image(_) if found.is_none() => found = Some(node),
+            Kind::Text if node.text.trim().is_empty() => {}
+            Kind::SoftBreak => {}
+            _ => return None,
+        }
+    }
+    found
 }
 
 /// 去掉标记后的纯文本，用来判断链接地址是否值得另显。
