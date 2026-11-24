@@ -1433,8 +1433,11 @@ impl Role for SphinxRole {
 fn display_role_text(text: &str) -> String {
     // Sphinx 用前导 `!` 表示「只显示文字、不要链接」，终端里正好只要文字
     let text = text.strip_prefix('!').unwrap_or(text);
-    match text.rsplit_once(" <") {
-        Some((title, target)) if target.ends_with('>') => title.trim().to_string(),
+    // 显式标题可以写成 `标题 <目标>`，也可以紧贴着写 `标题<目标>`
+    match text.rsplit_once('<') {
+        Some((title, target)) if target.ends_with('>') && !title.trim().is_empty() => {
+            title.trim().to_string()
+        }
         _ => text.to_string(),
     }
 }
@@ -1537,6 +1540,7 @@ mod tests {
     fn sphinx_角色只显示文字() {
         assert_eq!(render(":func:`asyncio.run`\n"), "asyncio.run\n");
         assert_eq!(render(":mod:`!argparse`\n"), "argparse\n");
+        assert_eq!(render(":doc:`layer<layer-concept>`\n"), "layer\n");
         assert_eq!(render(":ref:`Some section <target>`\n"), "Some section\n");
     }
 
