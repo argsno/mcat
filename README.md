@@ -4,7 +4,7 @@
     <img src=".github/readme/banner-light.svg" alt="$ mcat" width="290">
   </picture>
 
-  <p><strong>一个会渲染 Markdown 的 <code>cat</code></strong></p>
+  <p><strong>一个会渲染 Markdown 和 reStructuredText 的 <code>cat</code></strong></p>
 
   <p>
     <a href="https://github.com/argsno/mcat/releases"><img src="https://img.shields.io/github/v/release/argsno/mcat?style=flat-square" alt="Release"></a>
@@ -17,14 +17,15 @@
   <img src=".github/readme/hero.png" alt="$ mcat examples/showcase.md 的真实渲染效果：标题、列表、任务清单、引用、表格、Rust 语法高亮和代码块色条" width="620">
 </div>
 
-看 Markdown、看代码、看图，一个命令。输出始终带颜色，行为和 `cat` 一致：
+看 Markdown、看 reStructuredText、看代码、看图，一个命令。输出始终带颜色，行为和 `cat` 一致：
 多个文件依次输出、读标准输入、`-` 表示标准输入、读不了的文件报错后继续。
 
-## 三种用法
+## 四种用法
 
 | | 命令 | 说明 |
 |---|---|---|
 | **Markdown 渲染** | `mcat README.md` | 标题分级配色、列表、引用、表格、任务清单、脚注，按 CommonMark 渲染 |
+| **reStructuredText 渲染** | `mcat docs/index.rst` | 章节标题、列表、定义/字段列表、表格（含跨行跨列）、代码块、图片和替换引用 |
 | **语法高亮** | `mcat src/main.rs` | 代码块和其他源码文件按语言上色，[bat](https://github.com/sharkdp/bat) 的语法集 + [syntect](https://github.com/trishume/syntect) 主题，纯 Rust 后端；默认跟随终端明暗 |
 | **看图** | `mcat examples/gradient.png` | Kitty 图形协议 / iTerm2 内联图片，图片直接画在终端里；认文件内容，不认扩展名 |
 
@@ -42,7 +43,7 @@ $ mcat --no-render README.md      # 完全等同 cat
 
 ```mermaid
 flowchart LR
-  A[读文件] --> B{是 Markdown?}
+  A[读文件] --> B{是 Markdown / RST?}
   B -->|是| C[解析成块树]
   B -->|否| D[语法高亮]
   C --> E[渲染成 ANSI]
@@ -53,6 +54,17 @@ flowchart LR
 都没有就按亮色。要固定配色用 `--mermaid-theme light` 或 `dark`。图的底色是透明的，
 不会在深色终端里变成一块白方块。画不出来（协议不支持、源码有语法错、图类型 merman
 不支持）就退回显示源码，不报错。
+
+## reStructuredText
+
+`.rst` 和 `.rest` 文件按 reStructuredText 渲染：章节标题、段落、列表、定义列表、字段列表、
+引用、行块、脚注、表格（含跨行跨列）、`.. include::`（按文件所在目录展开）、`.. image::`
+和 `|替换|` 图片、`.. code-block::` 代码块（带语法高亮，`mermaid` 会画成图）。解析用
+[lsdocs-rst](https://github.com/lsdocs/lsdocs-rst)，拿到的文档树和 Python docutils 一样。
+
+标准 docutils 语法之外不猜语义：Sphinx 的 `:func:`、`:ref:` 这类角色只显示角色里的文字，
+不解析交叉引用；Sphinx 特有的指令显示成一行 `.. name::`，内容照常渲染。`-l rst` 可以强制按
+reStructuredText 渲染，不管扩展名。
 
 ## 配置文件
 
@@ -102,10 +114,10 @@ no_color = false
   **表格例外**：比终端宽的表格会压窄列、把单元格内容折行，框线始终对齐；管道和重定向里不折。
 - **正文配色只用终端的 16 个基础色**，跟着你的调色板走；语法高亮用真彩色输出。
   `--theme auto`（默认）按终端背景选 `mcat-dark` / `mcat-light`，也可以用 `--theme` 强制指定。
-- **Markdown 代码块左边是一列背景色色条**，内容仍然缩进两格。色条是背景色而不是字符，
+- **代码块左边是一列背景色色条**，内容仍然缩进两格。色条是背景色而不是字符，
   选中复制代码块时只有原来的两个前导空格。单独看源码文件不加色条，保持顶格。
 - **语言先按整个文件名认，再按扩展名**：`Dockerfile`、`Makefile`、`.gitignore` 这类没有扩展名的
-  文件也能上色；还认不出就看首行 shebang，`-l` 可以强制指定。
+  文件也能上色；还认不出就看首行 shebang，`-l` 可以强制指定。`.md` 和 `.rst` 不走上色而是文档渲染。
 - **表格按显示宽度对齐**（中文、全角和整簇 emoji 都算两列），表头加粗；单元格里的 `<br>` 断行。
 - `-n` 数的是输出行。渲染会重排块，数字和源文件对不上——和 `cat -n` 的行为一致。
 - 不是合法 UTF-8 的文件原样输出，不做渲染。
@@ -156,7 +168,7 @@ cat 输出字节流，mcat 输出渲染后的样式给人看。要字节流时�
 
 **为什么 -n 的行号和源文件对不上？**
 
-它数的是输出行。Markdown 渲染会重排块（加横线、插空行），这和 `cat -n` 数输出行的行为是一致的。
+它数的是输出行。文档渲染会重排块（加横线、插空行），这和 `cat -n` 数输出行的行为是一致的。
 
 ## 开发
 

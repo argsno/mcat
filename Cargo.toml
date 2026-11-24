@@ -17,6 +17,8 @@ merman = { version = "0.7.0", features = ["render", "raster"] }
 # 带进这份依赖，这里只是直接用它，不新增编译单元。
 rustix = { version = "1.1.5", features = ["termios"] }
 pulldown-cmark = "0.13.4"
+# reStructuredText：docutils 的 Rust 移植，纯 Rust，只带进 unicode-normalization 和 tinyvec。
+lsdocs-rst = "0.1.0"
 sha2 = "0.11.0"
 # 纯 Rust 的 regex 后端，避免 onig(C) 依赖。只开用得到的部分：
 # default-fancy 还会带进 html、plist-load、yaml-load 和默认语法集，mcat 都用不到。

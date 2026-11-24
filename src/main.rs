@@ -1,6 +1,6 @@
-//! mcat —— 一个会渲染 Markdown 的 cat。
+//! mcat —— 一个会渲染 Markdown / reStructuredText 的 cat。
 //!
-//! 读文件（或者标准输入），Markdown 渲染成终端样式，
+//! 读文件（或者标准输入），Markdown / reStructuredText 渲染成终端样式，
 //! 其他文件按扩展名猜语言做语法高亮，语义和 cat 保持一致：
 //! 多个文件依次输出到标准输出，读不了的文件报错后继续。
 
@@ -9,7 +9,9 @@ mod highlight;
 mod image;
 mod markdown;
 mod mermaid;
+mod rst;
 mod style;
+mod table;
 mod terminal;
 
 use clap::Parser;
@@ -27,13 +29,15 @@ use syntect::parsing::SyntaxReference;
 
 /// 这些扩展名按 Markdown 处理。
 const MD_EXTS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn", "mdx"];
+/// 这些扩展名按 reStructuredText 处理。
+const RST_EXTS: &[&str] = &["rst", "rest"];
 
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "带 Markdown 渲染的 cat",
-    long_about = "带 Markdown 渲染的 cat。\
-                  Markdown 文件渲染成终端样式，其他文件按语言做语法高亮。\
+    about = "带 Markdown / reStructuredText 渲染的 cat",
+    long_about = "带 Markdown / reStructuredText 渲染的 cat。\
+                  Markdown 和 reStructuredText 文件渲染成终端样式，其他文件按语言做语法高亮。\
                   不给文件时读标准输入。\
                   默认值也可以写在配置文件里，见 --config。",
     // 配置文件里的参数排在真实参数前面，同名参数要让后面的赢
@@ -52,7 +56,7 @@ struct Cli {
     #[arg(long, overrides_with = "numbers")]
     no_numbers: bool,
 
-    /// 强制指定语言：md、text、rust 等，不靠扩展名猜
+    /// 强制指定语言：md、rst、text、rust 等，不靠扩展名猜
     #[arg(short = 'l', long, value_name = "LANG")]
     language: Option<String>,
 
@@ -338,8 +342,9 @@ fn check_images(cli: &Cli) -> ExitCode {
                 continue;
             }
         };
-        // 文件本身就是图片时没有 Markdown 树，直接把它当成唯一一张待查的图
+        // 文件本身就是图片时没有文档树，直接把它当成唯一一张待查的图
         let standalone = Images::is_image(source.as_bytes());
+        let rst = is_rst(cli, path);
         let (urls, renderer) = if standalone {
             (
                 vec![path.to_string_lossy().into_owned()],
@@ -347,7 +352,12 @@ fn check_images(cli: &Cli) -> ExitCode {
             )
         } else {
             let renderer = images.for_file(base_dir(Some(path)));
-            (markdown::image_urls(&source), renderer)
+            let urls = if rst {
+                rst::image_urls(&source, Some(path))
+            } else {
+                markdown::image_urls(&source)
+            };
+            (urls, renderer)
         };
         let self_protocol = images.protocol();
         for url in urls {
@@ -414,7 +424,11 @@ fn check_images(cli: &Cli) -> ExitCode {
         if !standalone {
             let preference = mermaid_theme(cli);
             let sizing = images.sizing();
-            let blocks = markdown::mermaid_sources(&source);
+            let blocks = if rst {
+                rst::mermaid_sources(&source, Some(path))
+            } else {
+                markdown::mermaid_sources(&source)
+            };
             let renderer = mermaid::Renderer::new(preference);
             if !blocks.is_empty() {
                 let source = match preference {
@@ -594,6 +608,23 @@ fn emit(
             .render(text);
             out.write_block(&rendered);
         }
+        Mode::Rst => {
+            // 图片相对路径以 RST 文件所在目录为基准，和 Markdown 一致
+            let renderer = images.map(|images| images.for_file(base_dir(path)));
+            let renderer = rst::Rst::new(
+                hl,
+                !cli.no_color,
+                renderer.as_ref(),
+                diagrams.map(|(renderer, sizing)| (renderer, *sizing)),
+            )
+            .with_width(table_width(cli));
+            let mut renderer = match path {
+                Some(path) => renderer.with_source(path),
+                None => renderer,
+            };
+            let rendered = renderer.render(text);
+            out.write_block(&rendered);
+        }
         Mode::Syntax(syntax) => {
             // 逐行写出。原文结尾没有换行时也不补，保持和 cat 一致
             let lines = hl.lines(text, syntax);
@@ -614,9 +645,30 @@ fn emit(
 
 enum Mode<'a> {
     Markdown,
+    Rst,
     Syntax(&'a SyntaxReference),
     /// 原样输出，不加任何样式
     Raw,
+}
+
+/// 这个文件会不会被当成 reStructuredText 渲染。
+/// `--check-images` 用它决定从哪种语法树里收集图片。
+fn is_rst(cli: &Cli, path: &Path) -> bool {
+    if let Some(lang) = &cli.language {
+        return rst_language(lang);
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|ext| RST_EXTS.contains(&ext.as_str()))
+}
+
+/// 语言名是不是 reStructuredText 的写法。`-l` 和 `--check-images` 共用一份判断。
+fn rst_language(lang: &str) -> bool {
+    matches!(
+        lang.to_ascii_lowercase().as_str(),
+        "rst" | "rest" | "restructuredtext" | "restructured-text"
+    )
 }
 
 fn resolve<'a>(cli: &Cli, hl: &'a Highlighter, path: Option<&Path>, first_line: &str) -> Mode<'a> {
@@ -630,6 +682,7 @@ fn resolve<'a>(cli: &Cli, hl: &'a Highlighter, path: Option<&Path>, first_line: 
         match lang.to_ascii_lowercase().as_str() {
             "md" | "markdown" => return Mode::Markdown,
             "text" | "txt" | "plain" | "none" => return Mode::Raw,
+            name if rst_language(name) => return Mode::Rst,
             name => {
                 if let Some(syntax) = hl.by_name(name) {
                     return Mode::Syntax(syntax);
@@ -651,6 +704,9 @@ fn resolve<'a>(cli: &Cli, hl: &'a Highlighter, path: Option<&Path>, first_line: 
 
     if MD_EXTS.contains(&ext.as_str()) {
         return Mode::Markdown;
+    }
+    if RST_EXTS.contains(&ext.as_str()) {
+        return Mode::Rst;
     }
 
     let file_name = path
@@ -697,6 +753,38 @@ mod tests {
             resolve(&cli, &hl, Some(Path::new("README.md")), "# hi"),
             Mode::Markdown
         ));
+    }
+
+    #[test]
+    fn rst_按扩展名渲染() {
+        let hl = highlighter();
+        let cli = Cli::parse_from(["mcat"]);
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("README.rst")), "Title\n====="),
+            Mode::Rst
+        ));
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("a.rest")), ""),
+            Mode::Rst
+        ));
+        // 语言参数优先于扩展名
+        let cli = Cli::parse_from(["mcat", "-l", "rust"]);
+        assert!(matches!(
+            resolve(&cli, &hl, Some(Path::new("a.rst")), "fn main() {}"),
+            Mode::Syntax(s) if s.name == "Rust"
+        ));
+    }
+
+    #[test]
+    fn language_参数可以强制_rst() {
+        let hl = highlighter();
+        for name in ["rst", "rest", "reStructuredText"] {
+            let cli = Cli::parse_from(["mcat", "-l", name]);
+            assert!(matches!(
+                resolve(&cli, &hl, Some(Path::new("a.txt")), ""),
+                Mode::Rst
+            ));
+        }
     }
 
     #[test]

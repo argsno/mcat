@@ -7,9 +7,8 @@ use crate::highlight::{Highlighter, write_code_prefix};
 use crate::image::{Renderer as ImageRenderer, Sizing};
 use crate::mermaid::Renderer as MermaidRenderer;
 use crate::style::{Color, Painter, Style, TextBuf, display_width, wrap_styled};
-use pulldown_cmark::{
-    Alignment as Align, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag,
-};
+use crate::table::{Align, available, fit_widths, pad};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 use std::collections::HashMap;
 
 // 配色只用 ANSI 0-15 的主题色，这样用户改终端调色板时整体依然协调。
@@ -19,10 +18,10 @@ const C_H3: Color = Color::Ansi(13);
 const C_H4: Color = Color::Ansi(10);
 const C_H5: Color = Color::Ansi(11);
 const C_H6: Color = Color::Ansi(15);
-const C_CODE_SPAN: Color = Color::Ansi(3);
-const C_LINK: Color = Color::Ansi(12);
-const C_MUTED: Color = Color::Ansi(8);
-const C_BULLET: Color = Color::Ansi(6);
+pub(crate) const C_CODE_SPAN: Color = Color::Ansi(3);
+pub(crate) const C_LINK: Color = Color::Ansi(12);
+pub(crate) const C_MUTED: Color = Color::Ansi(8);
+pub(crate) const C_BULLET: Color = Color::Ansi(6);
 const C_TASK_DONE: Color = Color::Ansi(10);
 
 const S_H1: Style = Style::new().bold().fg(C_H1);
@@ -31,20 +30,20 @@ const S_H3: Style = Style::new().bold().fg(C_H3);
 const S_H4: Style = Style::new().bold().fg(C_H4);
 const S_H5: Style = Style::new().bold().fg(C_H5);
 const S_H6: Style = Style::new().bold().fg(C_H6);
-const S_CODE_SPAN: Style = Style::new().fg(C_CODE_SPAN);
-const S_LINK: Style = Style::new().fg(C_LINK).underline();
-const S_MUTED: Style = Style::new().fg(C_MUTED);
-const S_BULLET: Style = Style::new().fg(C_BULLET);
-const S_BORDER: Style = Style::new().fg(C_MUTED);
-const S_RULE: Style = Style::new().fg(C_MUTED);
-const S_IMAGE: Style = Style::new().dim();
+pub(crate) const S_CODE_SPAN: Style = Style::new().fg(C_CODE_SPAN);
+pub(crate) const S_LINK: Style = Style::new().fg(C_LINK).underline();
+pub(crate) const S_MUTED: Style = Style::new().fg(C_MUTED);
+pub(crate) const S_BULLET: Style = Style::new().fg(C_BULLET);
+pub(crate) const S_BORDER: Style = Style::new().fg(C_MUTED);
+pub(crate) const S_RULE: Style = Style::new().fg(C_MUTED);
+pub(crate) const S_IMAGE: Style = Style::new().dim();
 
 /// 水平分隔线的宽度。
-const RULE_WIDTH: usize = 60;
+pub(crate) const RULE_WIDTH: usize = 60;
 /// 认成 mermaid 图的代码块语言标记。
-const MERMAID_LANG: &str = "mermaid";
+pub(crate) const MERMAID_LANG: &str = "mermaid";
 
-fn heading_style(level: u8) -> Style {
+pub(crate) fn heading_style(level: u8) -> Style {
     match level {
         1 => S_H1,
         2 => S_H2,
@@ -187,8 +186,8 @@ impl Builder {
                         Node::with_text(Kind::FootnoteDef, name.to_string())
                     }
                     Tag::Table(aligns) => {
-                        self.aligns = aligns.clone();
-                        Node::new(Kind::Table(aligns))
+                        self.aligns = aligns.iter().copied().map(Align::from).collect();
+                        Node::new(Kind::Table(self.aligns.clone()))
                     }
                     Tag::TableHead | Tag::TableRow => {
                         self.col = 0;
@@ -758,7 +757,10 @@ impl<'a, 'i> Markdown<'a, 'i> {
             *w = width.max(1);
         }
         // 放不下就把列压窄，单元格内容折行；放得下时宽度不变
-        let widths = fit_widths(&natural, available(self.width, cfg, columns));
+        let widths = fit_widths(
+            &natural,
+            available(self.width, display_width(&cfg.prefix), columns),
+        );
         let wrap = |cells: &[Vec<String>]| -> Vec<Vec<String>> {
             cells
                 .iter()
@@ -975,58 +977,6 @@ fn plain_text(nodes: &[Node]) -> String {
         }
     }
     out
-}
-
-/// 表格能用的内容宽度：终端宽度减掉边框、内边距和行首前缀。
-/// 没有终端宽度（管道、重定向）时返回 `usize::MAX`，也就是不折行。
-fn available(width: Option<usize>, cfg: &Cfg, columns: usize) -> usize {
-    let Some(term) = width else {
-        return usize::MAX;
-    };
-    let frame = 3 * columns + 1 + display_width(&cfg.prefix);
-    term.saturating_sub(frame)
-}
-
-/// 把各列的自然宽度压进 `budget`：挑当前最宽的列一格格削，直到放得下。
-///
-/// 每列至少留两格：一个汉字或 emoji 就占两格，再窄就一定会把内容挤到框线外面去。
-/// 连这个下限都放不下时保持原样——宁可整张表超出终端宽度（让它自己折行），
-/// 也不能把框线挤断。
-fn fit_widths(natural: &[usize], budget: usize) -> Vec<usize> {
-    let floor: Vec<usize> = natural.iter().map(|w| (*w).min(2)).collect();
-    if budget < floor.iter().sum::<usize>() {
-        return natural.to_vec();
-    }
-    let mut widths = natural.to_vec();
-    while widths.iter().sum::<usize>() > budget {
-        let widest = widths
-            .iter()
-            .zip(&floor)
-            .enumerate()
-            .filter(|(_, (w, low))| w > low)
-            .max_by_key(|(_, (w, _))| **w)
-            .map(|(i, _)| i);
-        match widest {
-            Some(i) => widths[i] -= 1,
-            None => break,
-        }
-    }
-    widths
-}
-
-/// 单元格内容按对齐方式补齐，两侧各留一格空格。
-/// 宽度用的是显示宽度，所以中文也能对齐。
-fn pad(text: &str, width: usize, align: Align) -> String {
-    let fill = width.saturating_sub(display_width(text));
-    let body = match align {
-        Align::Center => {
-            let left = fill / 2;
-            format!("{}{}{}", " ".repeat(left), text, " ".repeat(fill - left))
-        }
-        Align::Right => format!("{}{}", " ".repeat(fill), text),
-        _ => format!("{}{}", text, " ".repeat(fill)),
-    };
-    format!(" {body} ")
 }
 
 fn cell_align(node: &Node, aligns: &[Align]) -> Align {

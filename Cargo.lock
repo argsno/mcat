@@ -1320,6 +1320,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lsdocs-rst"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcdc53981162726640a3084cae7872ef377e8fad33d4d5a5c486a4d28b0581d4"
+dependencies = [
+ "unicode-normalization",
+]
+
+[[package]]
 name = "manatee"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1349,6 +1358,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "image",
+ "lsdocs-rst",
  "merman",
  "pulldown-cmark 0.13.4",
  "rustix",
@@ -2816,6 +2826,15 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-properties"
